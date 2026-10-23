@@ -4,7 +4,7 @@ ChatCode 是一个 Windows 本地 MCP 服务，让 ChatGPT 网页版在用户授
 
 ## 当前状态
 
-本仓库从空项目开始实现，当前交付聚焦于可运行的本地 MVP：管理界面和多工作区授权、MCP stdio 工具、Windows 文件安全辅助程序、两阶段文件修改审批、Unified Diff 批次暂存与恢复、白名单项目脚本任务、操作日志及集中临时目录。ChatGPT 账号、工作区权限、OpenAI Tunnel ID 和 Runtime API Key 必须由用户在各自官方页面配置；ChatCode 不会读取或复用 WinCodex 的凭据。
+本仓库提供本机管理页、MCP stdio 工具、Windows 文件句柄安全辅助程序和分块文件传输。工作区可设为只读、可写并逐项审批，或由本机用户单独确认后可写且无需 ChatCode 本机逐项审批。任意文件格式通过原始字节分块读写；`data/changes.json` 保存小型审批元数据，大文件正文位于 `.tmp/uploads`。白名单项目脚本仍要求独立本机审批。ChatGPT 账号、工作区权限、OpenAI Tunnel ID 和 Runtime API Key 必须由用户在各自官方页面配置；ChatCode 不会读取或复用 WinCodex 的凭据。
 
 ChatGPT 自定义 MCP 应用当前支持读和写工具，但能否在某个账号或工作区创建、安装和运行仍受账户、工作区角色及管理员限制。本机无法从本次 Codex 会话读取 ChatGPT 设置，因此当前账号的实际权限尚未验证。连接步骤和准确限制见 [`docs/chatgpt-mcp.md`](docs/chatgpt-mcp.md)。
 
@@ -41,10 +41,11 @@ npm start
 ## 授权工作区
 
 1. 打开本地管理页面。
-2. 输入本机项目目录的完整路径，选择只读或可写，然后点“添加工作区”。
+2. 输入本机项目目录的完整路径，选择只读、逐项审批写入或免逐项审批写入，然后点“添加工作区”。
 3. 仅通过该页面添加的目录才会暴露给 MCP。模型不能通过工具参数增加根目录。
-4. 需要写文件时，先在 ChatGPT 中调用 `stage_file_write` 或 `stage_unified_patch` 生成预览，再在本机管理页逐项检查并批准，最后调用 `apply_change`。已有文件逐个通过 Windows 原子替换写入；多文件补丁逐个批准和应用，不是一个原子事务。
-5. 项目命令同样先生成待审批任务；本机确认后才可启动。工具只接受 `test`、`build`、`lint`、`typecheck` 或 `check` 这些固定脚本名。
+4. 逐项审批模式中，ChatGPT 调用 `stage_file_write`、`stage_unified_patch` 或分块上传后，本机用户检查并批准，再调用 `apply_change`。免逐项审批模式直接执行普通文件创建、覆盖、文本替换、补丁和目录创建，并返回 SHA-256 与实际状态。ChatGPT 平台的写操作确认仍照常生效。
+5. 小文件可调用 `write_file`；大文件使用 `begin_write` → 重复 `write_chunk` → `commit_write`。`read_file_chunk` 按字节读取，单块最多 262144 字节；文件总大小没有应用层 1 MiB 上限。逐项审批的大文件正文和恢复副本使用 `.tmp/uploads` 文件，不会塞入 `data/changes.json`。多文件补丁逐个写入并报告结果及恢复 ID，不是一个原子事务。
+6. 项目命令同样先生成待审批任务；本机确认后才可启动。工具只接受 `test`、`build`、`lint`、`typecheck` 或 `check` 这些固定脚本名。
 
 OpenCode、codex-chatgpt-web 和 WinCodex 三个参考仓库，以及它们的父目录，都不能作为 ChatCode 工作区。
 
@@ -73,7 +74,7 @@ npm run test:browser
 npm run clean:tmp
 ```
 
-`test:browser` 使用独立临时数据目录和 Edge headless 配置，通过 DevTools 协议实际点击表单、工作区权限按钮及设置页控件。测试报告和截图写入 `.tmp/tests/admin-browser-evidence`。
+`test:browser` 使用独立临时数据目录和 Edge headless 配置，通过 DevTools 协议实际点击表单、只读/逐项审批/免逐项审批权限按钮及设置页控件。测试报告和截图写入 `.tmp/tests/admin-browser-evidence`。
 
 运行时和测试临时文件放在项目 `.tmp` 下；`clean:tmp` 只清理白名单临时子目录，不删除 `data`、凭据、源代码或仍在运行的服务。npm 依赖使用标准 `node_modules`，可在确认 ChatCode 停止后手动删除并重新执行 `npm install`。
 

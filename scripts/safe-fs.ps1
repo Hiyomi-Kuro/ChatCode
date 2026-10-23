@@ -1,11 +1,15 @@
 ﻿param(
-  [Parameter(Mandatory=$true)][ValidateSet('canonical-root','info','exists','list','read','write','create','mkdir')][string]$Operation,
+  [Parameter(Mandatory=$true)][ValidateSet('canonical-root','info','exists','list','list-cursor','read','read-chunk','hash','write','truncate-staging','write-staged','copy-to-staging','create','mkdir')][string]$Operation,
   [Parameter(Mandatory=$true)][string]$RootPath,
   [string]$RelativePath = '',
   [string]$ExpectedHash = '',
   [ValidateRange(1,67108864)][long]$MaxBytes = 1048576,
-  [ValidateRange(0,100000)][int]$Offset = 0,
-  [ValidateRange(1,500)][int]$Limit = 200
+  [string]$Offset = '0',
+  [ValidateRange(1,500)][int]$Limit = 200,
+  [ValidateRange(1,262144)][int]$ChunkLength = 262144,
+  [string]$StagingRoot = '',
+  [string]$StagingPath = '',
+  [string]$Cursor = ''
 )
 $ErrorActionPreference = 'Stop'
 $utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -17,6 +21,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -62,6 +67,12 @@ namespace ChatCode {
     static extern bool ReplaceFileNative(string replaced, string replacement, string backup, uint flags, IntPtr exclude, IntPtr reserved);
     [DllImport("kernel32.dll", EntryPoint="DeleteFileW", CharSet=CharSet.Unicode, SetLastError=true)]
     static extern bool DeleteFileNative(string path);
+    [DllImport("kernel32.dll", EntryPoint="MoveFileExW", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern bool MoveFileExNative(string existing, string replacement, uint flags);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool DuplicateHandle(IntPtr sourceProcess, SafeFileHandle source, IntPtr targetProcess, out SafeFileHandle target, uint access, bool inherit, uint options);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
     [DllImport("kernel32.dll", SetLastError=true)]
     static extern bool GetFileInformationByHandle(SafeFileHandle handle, out BY_HANDLE_FILE_INFORMATION info);
     [StructLayout(LayoutKind.Sequential)]
@@ -91,6 +102,12 @@ namespace ChatCode {
         throw new Win32Exception(error, "无法安全打开目标路径。");
       }
       return handle;
+    }
+    static SafeFileHandle Duplicate(SafeFileHandle handle) {
+      SafeFileHandle copy;
+      IntPtr process = GetCurrentProcess();
+      if (!DuplicateHandle(process, handle, process, out copy, 0, false, 2)) throw new Win32Exception(Marshal.GetLastWin32Error(), "无法复制已验证的文件句柄。");
+      return copy;
     }
     static string Final(SafeFileHandle handle) {
       StringBuilder value = new StringBuilder(32768);
@@ -186,9 +203,22 @@ namespace ChatCode {
         return value.ToString();
       }
     }
+    static string HashStream(Stream stream) {
+      long original = stream.Position; stream.Position = 0;
+      using (SHA256 sha = SHA256.Create()) {
+        byte[] digest = sha.ComputeHash(stream); StringBuilder value = new StringBuilder();
+        foreach (byte item in digest) value.Append(item.ToString("x2"));
+        stream.Position = original;
+        return value.ToString();
+      }
+    }
     static string Modified(HandleInfo info) {
       long ticks = ((long)info.WriteHigh << 32) | info.WriteLow;
       return DateTime.FromFileTimeUtc(ticks).ToString("o");
+    }
+    static string Version(HandleInfo info) {
+      return info.VolumeSerial.ToString("x8") + ":" + info.FileIndexHigh.ToString("x8") + info.FileIndexLow.ToString("x8") + ":" +
+        info.WriteHigh.ToString("x8") + info.WriteLow.ToString("x8") + ":" + Size(info).ToString(CultureInfo.InvariantCulture);
     }
     public static string CanonicalRoot(string rootPath) {
       string root = Normalize(rootPath);
@@ -198,7 +228,18 @@ namespace ChatCode {
     }
     public static object GetInfo(string root, string relative) {
       using (Verified item = OpenVerified(root, relative, READ_ATTRIBUTES, null, true)) {
-        return new { path = item.TargetFinal, isDirectory = (item.Info.Attributes & ATTR_DIRECTORY) != 0, size = Size(item.Info), modified = Modified(item.Info) };
+        return new { path = item.TargetFinal, isDirectory = (item.Info.Attributes & ATTR_DIRECTORY) != 0, size = Size(item.Info), sizeBytes = Size(item.Info).ToString(CultureInfo.InvariantCulture), modified = Modified(item.Info), version = Version(item.Info) };
+      }
+    }
+    public static object HashFile(string root, string relative) {
+      using (Verified item = OpenVerified(root, relative, GENERIC_READ, false, false)) {
+        using (FileStream stream = new FileStream(Duplicate(item.Target), FileAccess.Read, 65536, false)) {
+          using (SHA256 sha = SHA256.Create()) {
+            byte[] digest = sha.ComputeHash(stream); StringBuilder value = new StringBuilder();
+            foreach (byte part in digest) value.Append(part.ToString("x2"));
+            return new { sha256 = value.ToString(), sizeBytes = stream.Length.ToString(CultureInfo.InvariantCulture), version = Version(item.Info) };
+          }
+        }
       }
     }
     public static bool Exists(string root, string relative) {
@@ -214,7 +255,6 @@ namespace ChatCode {
         List<object> entries = new List<object>();
         List<string> names = new List<string>();
         foreach (string candidate in Directory.EnumerateFileSystemEntries(item.TargetFinal)) {
-          if (names.Count >= 10001) throw new IOException("目录条目超过 10000 项的单次分页扫描上限。");
           names.Add(candidate);
         }
         names.Sort(StringComparer.OrdinalIgnoreCase);
@@ -240,11 +280,44 @@ namespace ChatCode {
         return new { entries = entries, offset = offset, total = total, nextOffset = end < total ? (int?)end : null };
       }
     }
+    public static object ListCursor(string root, string relative, string cursor, int limit) {
+      if (cursor == null || cursor.Length > 255 || cursor.IndexOf('\0') >= 0) throw new IOException("目录游标无效。");
+      using (Verified item = OpenVerified(root, relative, READ_ATTRIBUTES, true, true)) {
+        SortedSet<string> names = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        long total = 0;
+        foreach (string candidate in Directory.EnumerateFileSystemEntries(item.TargetFinal)) {
+          total++;
+          string name = Path.GetFileName(candidate);
+          if (cursor.Length > 0 && StringComparer.OrdinalIgnoreCase.Compare(name, cursor) <= 0) continue;
+          names.Add(name);
+          if (names.Count > limit + 1) names.Remove(names.Max);
+        }
+        bool more = names.Count > limit;
+        List<object> entries = new List<object>();
+        string nextCursor = null;
+        int index = 0;
+        foreach (string name in names) {
+          if (index >= limit) break;
+          string child = relative == "" || relative == "." ? name : relative.Replace('/',Path.DirectorySeparatorChar).Replace('\\',Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar + name;
+          try {
+            using (Verified found = OpenVerified(root, child, READ_ATTRIBUTES, null, false)) {
+              entries.Add(new { name = name, isDirectory = (found.Info.Attributes & ATTR_DIRECTORY) != 0, size = Size(found.Info), modified = Modified(found.Info) });
+              nextCursor = name;
+            }
+          } catch (UnauthorizedAccessException) {
+            entries.Add(new { name = name, isDirectory = false, size = 0L, modified = (string)null, blocked = true });
+            nextCursor = name;
+          } catch (IOException) { nextCursor = name; }
+          index++;
+        }
+        return new { entries = entries, total = total, nextCursor = more ? nextCursor : null, hasMore = more };
+      }
+    }
     public static string Read(string root, string relative, long maxBytes) {
       using (Verified item = OpenVerified(root, relative, GENERIC_READ, false, false)) {
         long size = Size(item.Info);
         if (size > maxBytes) throw new IOException("文件超过单次读取上限。");
-        using (FileStream stream = new FileStream(item.Target, FileAccess.Read, 8192, false)) {
+        using (FileStream stream = new FileStream(Duplicate(item.Target), FileAccess.Read, 8192, false)) {
           byte[] data = new byte[(int)size]; int total = 0;
           while (total < data.Length) { int count = stream.Read(data, total, data.Length - total); if (count == 0) break; total += count; }
           if (total != data.Length) Array.Resize(ref data, total);
@@ -252,16 +325,26 @@ namespace ChatCode {
         }
       }
     }
+    public static object ReadChunk(string root, string relative, long offset, int length) {
+      if (offset < 0 || length < 1 || length > 262144) throw new ArgumentOutOfRangeException("读取分块参数无效。");
+      using (Verified item = OpenVerified(root, relative, GENERIC_READ, false, false)) {
+        using (FileStream stream = new FileStream(Duplicate(item.Target), FileAccess.Read, 65536, false)) {
+          long size = stream.Length;
+          if (offset > size) throw new IOException("字节 offset 超出文件末尾。");
+          int count = (int)Math.Min((long)length, size - offset);
+          byte[] data = new byte[count]; stream.Position = offset;
+          int total = 0;
+          while (total < count) { int read = stream.Read(data, total, count - total); if (read == 0) break; total += read; }
+          if (total != count) Array.Resize(ref data, total);
+          return new { data = Convert.ToBase64String(data), bytesRead = data.Length, sizeBytes = size.ToString(CultureInfo.InvariantCulture), modified = Modified(item.Info), version = Version(item.Info), nextOffset = (offset + data.Length).ToString(CultureInfo.InvariantCulture), eof = offset + data.Length >= size };
+        }
+      }
+    }
     public static object Write(string root, string relative, string expectedHash, string contentBase64) {
       byte[] replacement = Convert.FromBase64String(contentBase64);
       using (Verified item = OpenVerified(root, relative, GENERIC_READ, false, false, SHARE_READ | SHARE_WRITE | SHARE_DELETE)) {
-        byte[] original;
-        using (FileStream stream = new FileStream(item.TargetFinal, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete)) {
-          if (stream.Length > 16777216) throw new IOException("拒绝修改超过 16 MiB 的文件。");
-          original = new byte[(int)stream.Length]; int count = 0;
-          while (count < original.Length) { int read = stream.Read(original, count, original.Length - count); if (read == 0) break; count += read; }
-          if (count != original.Length) Array.Resize(ref original, count);
-          string actualHash = Hash(original);
+        using (FileStream stream = new FileStream(Duplicate(item.Target), FileAccess.Read, 65536, false)) {
+          string actualHash = HashStream(stream);
           if (!String.Equals(actualHash, expectedHash, StringComparison.OrdinalIgnoreCase)) throw new IOException("文件版本已变化，请重新读取并生成 Diff。");
         }
         string temporary = Path.Combine(Path.GetDirectoryName(item.TargetFinal), ".chatcode-" + Guid.NewGuid().ToString("N") + ".tmp");
@@ -275,14 +358,9 @@ namespace ChatCode {
               stream.Write(replacement, 0, replacement.Length); stream.Flush(true);
             }
           }
-          byte[] current;
-          using (FileStream stream = new FileStream(item.TargetFinal, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
-            if (stream.Length > 16777216) throw new IOException("拒绝修改超过 16 MiB 的文件。");
-            current = new byte[(int)stream.Length]; int count = 0;
-            while (count < current.Length) { int read = stream.Read(current, count, current.Length - count); if (read == 0) break; count += read; }
-            if (count != current.Length) Array.Resize(ref current, count);
+          using (FileStream stream = new FileStream(Duplicate(item.Target), FileAccess.Read, 65536, false)) {
+            if (!String.Equals(HashStream(stream), expectedHash, StringComparison.OrdinalIgnoreCase)) throw new IOException("文件版本在暂存期间已变化；目标文件保持不变，请重新读取并生成 Diff。");
           }
-          if (!String.Equals(Hash(current), expectedHash, StringComparison.OrdinalIgnoreCase)) throw new IOException("文件版本在暂存期间已变化；目标文件保持不变，请重新读取并生成 Diff。");
           if (!ReplaceFileNative(item.TargetFinal, temporary, null, 0, IntPtr.Zero, IntPtr.Zero))
             throw new Win32Exception(Marshal.GetLastWin32Error(), "无法原子替换目标文件；原文件保持不变。");
           replaced = true;
@@ -292,20 +370,136 @@ namespace ChatCode {
         }
       }
     }
+    public static object WriteStaged(string root, string relative, string expectedHash, string stagingRoot, string stagingPath) {
+      if (String.IsNullOrWhiteSpace(stagingRoot) || String.IsNullOrWhiteSpace(stagingPath)) throw new UnauthorizedAccessException("缺少受控上传暂存路径。");
+      string stagingFinalRoot = Normalize(stagingRoot);
+      using (SafeFileHandle stagingRootHandle = Open(stagingFinalRoot, READ_ATTRIBUTES, SHARE_READ, OPEN_EXISTING, true)) {
+        HandleInfo stagingInfo = Info(stagingRootHandle); CheckNoReparse(stagingInfo); CheckDirectory(stagingInfo);
+        if (!String.Equals(Final(stagingRootHandle), stagingFinalRoot, StringComparison.OrdinalIgnoreCase)) throw new UnauthorizedAccessException("上传暂存根目录路径发生变化。");
+      }
+      using (SafeFileHandle sourceHandle = Open(stagingPath, GENERIC_READ, SHARE_READ, OPEN_EXISTING, false)) {
+        HandleInfo sourceInfo = Info(sourceHandle); CheckNoReparse(sourceInfo);
+        string sourceFinal = Final(sourceHandle);
+        if (!Inside(stagingFinalRoot, sourceFinal)) throw new UnauthorizedAccessException("上传内容不在受控暂存目录内。");
+        using (FileStream source = new FileStream(sourceHandle, FileAccess.Read, 65536, false)) {
+          using (Verified parent = OpenParent(root, relative)) {
+            string normalized = Relative(relative, false);
+            string target = Path.Combine(parent.TargetFinal, Path.GetFileName(normalized));
+            bool creating = String.IsNullOrEmpty(expectedHash);
+            Verified existing = null;
+            if (!creating) {
+              if (!System.Text.RegularExpressions.Regex.IsMatch(expectedHash, "^[a-fA-F0-9]{64}$")) throw new IOException("文件版本哈希无效。");
+              existing = OpenVerified(root, normalized, GENERIC_READ, false, false, SHARE_READ | SHARE_WRITE | SHARE_DELETE);
+              using (FileStream current = new FileStream(Duplicate(existing.Target), FileAccess.Read, 65536, false)) {
+                if (!String.Equals(HashStream(current), expectedHash, StringComparison.OrdinalIgnoreCase)) { existing.Dispose(); existing = null; throw new IOException("文件版本已变化，拒绝覆盖。"); }
+              }
+            } else if (Exists(root, normalized)) {
+              throw new IOException("目标文件已存在，拒绝覆盖。");
+            }
+            string temporary = Path.Combine(Path.GetDirectoryName(target), ".chatcode-" + Guid.NewGuid().ToString("N") + ".tmp");
+            bool published = false;
+            try {
+              string outputHash;
+              long outputSize;
+              using (SafeFileHandle staged = Open(temporary, GENERIC_READ | GENERIC_WRITE, SHARE_READ, CREATE_NEW, false)) {
+                HandleInfo stagedInfo = Info(staged); CheckNoReparse(stagedInfo);
+                if (!Inside(parent.RootFinal, Final(staged))) throw new UnauthorizedAccessException("写入临时文件路径离开了已授权目录。");
+                using (FileStream output = new FileStream(staged, FileAccess.ReadWrite, 65536, false)) {
+                  source.Position = 0; source.CopyTo(output, 65536); output.Flush(true); output.Position = 0;
+                  outputSize = output.Length; outputHash = HashStream(output);
+                }
+              }
+              if (creating) {
+                if (Exists(root, normalized)) throw new IOException("目标文件刚刚创建；保留已有目标。");
+                if (!MoveFileExNative(temporary, target, 8)) throw new Win32Exception(Marshal.GetLastWin32Error(), "无法原子发布新文件。");
+              } else {
+                using (FileStream current = new FileStream(Duplicate(existing.Target), FileAccess.Read, 65536, false)) {
+                  if (!String.Equals(HashStream(current), expectedHash, StringComparison.OrdinalIgnoreCase)) throw new IOException("文件版本在提交期间已变化，目标文件保持不变。");
+                }
+                if (!ReplaceFileNative(existing.TargetFinal, temporary, null, 0, IntPtr.Zero, IntPtr.Zero)) throw new Win32Exception(Marshal.GetLastWin32Error(), "无法原子替换目标文件；原文件保持不变。");
+              }
+              published = true;
+              return new { path = target, sha256 = outputHash, bytes = outputSize, sizeBytes = outputSize.ToString(CultureInfo.InvariantCulture) };
+            } finally {
+              if (!published) { try { DeleteFileNative(temporary); } catch { } }
+              if (existing != null) existing.Dispose();
+            }
+          }
+        }
+      }
+    }
+    public static object TruncateStaging(string stagingRoot, string stagingPath, long length) {
+      if (String.IsNullOrWhiteSpace(stagingRoot) || String.IsNullOrWhiteSpace(stagingPath)) throw new UnauthorizedAccessException("缺少受控上传暂存路径。");
+      if (length < 0) throw new IOException("暂存文件长度不能为负数。");
+      string stagingFinalRoot = Normalize(stagingRoot);
+      using (SafeFileHandle stagingRootHandle = Open(stagingFinalRoot, READ_ATTRIBUTES, SHARE_READ, OPEN_EXISTING, true)) {
+        HandleInfo stagingInfo = Info(stagingRootHandle); CheckNoReparse(stagingInfo); CheckDirectory(stagingInfo);
+        string verifiedRoot = Final(stagingRootHandle);
+        if (!String.Equals(verifiedRoot, stagingFinalRoot, StringComparison.OrdinalIgnoreCase)) throw new UnauthorizedAccessException("上传暂存根目录路径发生变化。");
+        string normalizedPath = Normalize(stagingPath);
+        if (!Inside(verifiedRoot, normalizedPath)) throw new UnauthorizedAccessException("暂存文件路径不在受控目录内。");
+        using (SafeFileHandle fileHandle = Open(normalizedPath, GENERIC_READ | GENERIC_WRITE, SHARE_READ, OPEN_EXISTING, false)) {
+          HandleInfo fileInfo = Info(fileHandle); CheckNoReparse(fileInfo);
+          if ((fileInfo.Attributes & ATTR_DIRECTORY) != 0) throw new IOException("上传暂存目标不是普通文件。");
+          if (!Inside(verifiedRoot, Final(fileHandle))) throw new UnauthorizedAccessException("暂存文件最终路径离开受控目录。");
+          using (FileStream stream = new FileStream(fileHandle, FileAccess.ReadWrite, 65536, false)) {
+            if (length > stream.Length) throw new IOException("不能把上传暂存文件扩展到已确认偏移。");
+            stream.SetLength(length); stream.Flush(true);
+            return new { sizeBytes = stream.Length.ToString(CultureInfo.InvariantCulture) };
+          }
+        }
+      }
+    }
+    public static object CopyToStaging(string root, string relative, string expectedHash, string stagingRoot, string stagingPath) {
+      if (!System.Text.RegularExpressions.Regex.IsMatch(expectedHash ?? "", "^[a-fA-F0-9]{64}$")) throw new IOException("文件版本哈希无效。");
+      string stagingFinalRoot = Normalize(stagingRoot);
+      using (SafeFileHandle stagingRootHandle = Open(stagingFinalRoot, READ_ATTRIBUTES, SHARE_READ, OPEN_EXISTING, true)) {
+        HandleInfo stagingInfo = Info(stagingRootHandle); CheckNoReparse(stagingInfo); CheckDirectory(stagingInfo);
+        if (!String.Equals(Final(stagingRootHandle), stagingFinalRoot, StringComparison.OrdinalIgnoreCase)) throw new UnauthorizedAccessException("上传暂存根目录路径发生变化。");
+      }
+      using (Verified sourceItem = OpenVerified(root, relative, GENERIC_READ, false, false)) {
+        string stagedFull = Normalize(stagingPath);
+        if (!Inside(stagingFinalRoot, stagedFull)) throw new UnauthorizedAccessException("备份路径不在受控暂存目录内。");
+        string actualHash;
+        long size;
+        using (FileStream source = new FileStream(Duplicate(sourceItem.Target), FileAccess.Read, 65536, false)) {
+          actualHash = HashStream(source); size = source.Length;
+          if (!String.Equals(actualHash, expectedHash, StringComparison.OrdinalIgnoreCase)) throw new IOException("文件版本已变化，不能创建审批备份。");
+          using (SafeFileHandle destination = Open(stagedFull, GENERIC_READ | GENERIC_WRITE, SHARE_READ, CREATE_NEW, false)) {
+            HandleInfo destinationInfo = Info(destination); CheckNoReparse(destinationInfo);
+            if (!Inside(stagingFinalRoot, Final(destination))) throw new UnauthorizedAccessException("备份文件最终路径离开暂存目录。");
+            using (FileStream output = new FileStream(destination, FileAccess.ReadWrite, 65536, false)) {
+              source.Position = 0; source.CopyTo(output, 65536); output.Flush(true); output.Position = 0;
+              if (!String.Equals(HashStream(output), expectedHash, StringComparison.OrdinalIgnoreCase)) throw new IOException("备份内容哈希校验失败。");
+            }
+          }
+          if (!String.Equals(HashStream(source), expectedHash, StringComparison.OrdinalIgnoreCase)) {
+            DeleteFileNative(stagedFull); throw new IOException("源文件在备份期间发生变化。");
+          }
+        }
+        return new { sha256 = actualHash, bytes = size, sizeBytes = size.ToString(CultureInfo.InvariantCulture) };
+      }
+    }
     public static object Create(string root, string relative, string contentBase64) {
       byte[] content = Convert.FromBase64String(contentBase64);
       using (Verified parent = OpenParent(root, relative)) {
         string normalized = Relative(relative, false); string target = Path.Combine(parent.TargetFinal, Path.GetFileName(normalized));
-        SafeFileHandle handle = Open(target, GENERIC_READ | GENERIC_WRITE, SHARE_READ, CREATE_NEW, false);
-        using (handle) {
-          HandleInfo info = Info(handle); CheckNoReparse(info);
-          string final = Final(handle);
-          if (!Inside(parent.RootFinal, final)) throw new UnauthorizedAccessException("新文件路径离开了已授权目录。");
-          using (FileStream stream = new FileStream(handle, FileAccess.ReadWrite, 8192, false)) {
-            try { stream.Write(content, 0, content.Length); stream.Flush(true); }
-            catch { try { DeleteByHandle(handle); } catch { } throw; }
+        string temporary = Path.Combine(parent.TargetFinal, ".chatcode-" + Guid.NewGuid().ToString("N") + ".tmp");
+        bool published = false;
+        try {
+          using (SafeFileHandle handle = Open(temporary, GENERIC_READ | GENERIC_WRITE, SHARE_READ, CREATE_NEW, false)) {
+            HandleInfo info = Info(handle); CheckNoReparse(info);
+            string final = Final(handle);
+            if (!Inside(parent.RootFinal, final)) throw new UnauthorizedAccessException("新文件路径离开了已授权目录。");
+            using (FileStream stream = new FileStream(handle, FileAccess.ReadWrite, 8192, false)) {
+              stream.Write(content, 0, content.Length); stream.Flush(true);
+            }
           }
-          return new { path = final, sha256 = Hash(content), bytes = content.Length };
+          if (!MoveFileExNative(temporary, target, 8)) throw new Win32Exception(Marshal.GetLastWin32Error(), "无法原子发布新文件；目标已存在或替换失败。");
+          published = true;
+          return new { path = target, sha256 = Hash(content), bytes = content.Length };
+        } finally {
+          if (!published) { try { DeleteFileNative(temporary); } catch { } }
         }
       }
     }
@@ -334,13 +528,37 @@ try {
   } elseif ($Operation -eq 'exists') {
     [Console]::Out.Write((ConvertTo-Json -InputObject ([ChatCode.SafeFs]::Exists($RootPath, $RelativePath))))
   } elseif ($Operation -eq 'list') {
-    $result = [ChatCode.SafeFs]::List($RootPath, $RelativePath, $Offset, $Limit)
+    $listOffset = 0
+    if (![int]::TryParse($Offset, [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$listOffset) -or $listOffset -lt 0) { throw '目录 offset 无效。' }
+    $result = [ChatCode.SafeFs]::List($RootPath, $RelativePath, $listOffset, $Limit)
+    [Console]::Out.Write((ConvertTo-Json -InputObject $result -Compress -Depth 5))
+  } elseif ($Operation -eq 'list-cursor') {
+    $result = [ChatCode.SafeFs]::ListCursor($RootPath, $RelativePath, $Cursor, $Limit)
     [Console]::Out.Write((ConvertTo-Json -InputObject $result -Compress -Depth 5))
   } elseif ($Operation -eq 'read') {
     [Console]::Out.Write([ChatCode.SafeFs]::Read($RootPath, $RelativePath, $MaxBytes))
+  } elseif ($Operation -eq 'read-chunk') {
+    $offsetValue = [long]0
+    if (![long]::TryParse($Offset, [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$offsetValue) -or $offsetValue -lt 0) { throw '字节 offset 无效。' }
+    $result = [ChatCode.SafeFs]::ReadChunk($RootPath, $RelativePath, $offsetValue, $ChunkLength)
+    [Console]::Out.Write((ConvertTo-Json -InputObject $result -Compress -Depth 5))
+  } elseif ($Operation -eq 'hash') {
+    $result = [ChatCode.SafeFs]::HashFile($RootPath, $RelativePath)
+    [Console]::Out.Write((ConvertTo-Json -InputObject $result -Compress -Depth 5))
   } elseif ($Operation -eq 'write') {
     if (!$payload -or $null -eq $payload.content) { throw '缺少待写入内容。' }
     $result = [ChatCode.SafeFs]::Write($RootPath, $RelativePath, $ExpectedHash, [string]$payload.content)
+    [Console]::Out.Write((ConvertTo-Json -InputObject $result -Compress -Depth 5))
+  } elseif ($Operation -eq 'write-staged') {
+    $result = [ChatCode.SafeFs]::WriteStaged($RootPath, $RelativePath, $ExpectedHash, $StagingRoot, $StagingPath)
+    [Console]::Out.Write((ConvertTo-Json -InputObject $result -Compress -Depth 5))
+  } elseif ($Operation -eq 'truncate-staging') {
+    $stagingLength = [long]0
+    if (![long]::TryParse($Offset, [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$stagingLength) -or $stagingLength -lt 0) { throw '暂存文件长度无效。' }
+    $result = [ChatCode.SafeFs]::TruncateStaging($StagingRoot, $StagingPath, $stagingLength)
+    [Console]::Out.Write((ConvertTo-Json -InputObject $result -Compress -Depth 5))
+  } elseif ($Operation -eq 'copy-to-staging') {
+    $result = [ChatCode.SafeFs]::CopyToStaging($RootPath, $RelativePath, $ExpectedHash, $StagingRoot, $StagingPath)
     [Console]::Out.Write((ConvertTo-Json -InputObject $result -Compress -Depth 5))
   } elseif ($Operation -eq 'create') {
     if (!$payload -or $null -eq $payload.content) { throw '缺少待写入内容。' }

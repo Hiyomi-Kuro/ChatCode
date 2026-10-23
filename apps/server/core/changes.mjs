@@ -1,24 +1,27 @@
 import { createHash, randomUUID } from "node:crypto"
+import path from "node:path"
 import { applyPatch, createTwoFilesPatch, parsePatch } from "diff"
 import { audit } from "./audit.mjs"
 import { mutateArray, readArray } from "./state.mjs"
-import { fileInfo, fileExists, readFileBytes, writeExistingFile, createNewFile, createDirectory } from "./safe-fs.mjs"
-import { hasBlockedExplicitDirectory, isSensitivePath, normalizeRelative } from "./paths.mjs"
-import { rejectManagedStatePath, requireWorkspace, getWorkspace } from "./workspaces.mjs"
+import { fileInfo, fileExists, hashFile, readFileBytes, writeExistingFile, writeStagedFile, createNewFile, createDirectory } from "./safe-fs.mjs"
+import { hasBlockedExplicitDirectory, normalizeRelative } from "./paths.mjs"
+import { isSensitiveAllowed, rejectManagedStatePath, requireWorkspace, getWorkspace } from "./workspaces.mjs"
+import { createStagedBlob, discardUploadFiles, markUploadApplied, uploadFilePath } from "./uploads.mjs"
+import { TMP_DIR } from "./config.mjs"
 
 const MAX_CHANGE_BYTES = 1_048_576
-const MAX_BATCH_BYTES = 4 * MAX_CHANGE_BYTES
 
 function sha256(buffer) {
   return createHash("sha256").update(buffer).digest("hex")
 }
 
 function safeView(change) {
-  const { originalBase64, proposedBase64, ...view } = change
+  const { originalBase64, proposedBase64, uploadedFileId, proposedBlobId, backupFileId, ...view } = change
   return view
 }
 
 async function getText(workspace, relative) {
+  if (!isSensitiveAllowed(workspace, relative)) throw new Error("拒绝访问受保护的敏感文件；请在本机管理页单独授权")
   if (hasBlockedExplicitDirectory(relative)) throw new Error("拒绝访问受保护的内部或生成目录")
   rejectManagedStatePath(workspace, relative)
   const info = await fileInfo(workspace.root, relative)
@@ -32,7 +35,7 @@ async function getText(workspace, relative) {
 export async function stageFileWrite({ workspace_id, path, content, expected_sha256, create = false }) {
   const workspace = await requireWorkspace(workspace_id, { writable: true })
   const relative = normalizeRelative(path)
-  if (isSensitivePath(relative)) throw new Error("拒绝修改受保护的敏感文件")
+  if (!isSensitiveAllowed(workspace, relative)) throw new Error("拒绝修改受保护的敏感文件；请在本机管理页单独授权")
   if (hasBlockedExplicitDirectory(relative)) throw new Error("拒绝修改受保护的内部或生成目录")
   rejectManagedStatePath(workspace, relative)
   if (typeof content !== "string" || Buffer.byteLength(content, "utf8") > MAX_CHANGE_BYTES) throw new Error("新文件内容上限为 1 MiB")
@@ -46,6 +49,14 @@ export async function stageFileWrite({ workspace_id, path, content, expected_sha
     const parentPath = relative.includes("/") ? relative.slice(0, relative.lastIndexOf("/")) : ""
     const parent = await fileInfo(workspace.root, parentPath)
     if (!parent.isDirectory) throw new Error("新文件的父目录不存在或不是目录")
+    if (workspace.mode === "autoWritable") {
+      const currentWorkspace = await requireWorkspace(workspace_id, { writable: true })
+      if (currentWorkspace.mode === "autoWritable") {
+        const result = await createNewFile(currentWorkspace.root, relative, Buffer.from(content, "utf8"))
+        await audit("file_written_direct", { workspaceId: currentWorkspace.id, path: relative, result: "created" })
+        return { path: relative, sha256_before: null, sha256_after: result.sha256, status: "applied", requires_local_approval: false, bytes: result.bytes }
+      }
+    }
   } else {
     if (!/^[a-f0-9]{64}$/i.test(expected_sha256 ?? "")) throw new Error("修改已存在文件时必须提供 read_file 返回的 sha256")
     const current = await getText(workspace, relative)
@@ -53,6 +64,14 @@ export async function stageFileWrite({ workspace_id, path, content, expected_sha
     original = current.bytes
     oldText = current.text
     oldHash = current.hash
+    if (workspace.mode === "autoWritable") {
+      const currentWorkspace = await requireWorkspace(workspace_id, { writable: true })
+      if (currentWorkspace.mode === "autoWritable") {
+        const result = await writeExistingFile(currentWorkspace.root, relative, oldHash, Buffer.from(content, "utf8"))
+        await audit("file_written_direct", { workspaceId: currentWorkspace.id, path: relative, result: "updated" })
+        return { path: relative, sha256_before: oldHash, sha256_after: result.sha256, status: "applied", requires_local_approval: false, bytes: result.bytes }
+      }
+    }
   }
 
   const proposed = Buffer.from(content, "utf8")
@@ -82,7 +101,7 @@ export async function stageReplace({ workspace_id, path, find, replace, expected
   if (typeof find !== "string" || !find || find.length > 100_000) throw new Error("find 参数不能为空且不能超过 100000 个字符")
   const workspace = await requireWorkspace(workspace_id, { writable: true })
   const relative = normalizeRelative(path)
-  if (isSensitivePath(relative)) throw new Error("拒绝修改受保护的敏感文件")
+  if (!isSensitiveAllowed(workspace, relative)) throw new Error("拒绝修改受保护的敏感文件；请在本机管理页单独授权")
   const current = await getText(workspace, relative)
   if (current.hash.toLowerCase() !== String(expected_sha256 ?? "").toLowerCase()) throw new Error("文件版本已变化，请重新读取后再生成修改")
   const first = current.text.indexOf(find)
@@ -96,11 +115,11 @@ export async function stageUnifiedPatch({ workspace_id, unified_patch, expected_
   if (typeof unified_patch !== "string" || !unified_patch.trim() || Buffer.byteLength(unified_patch, "utf8") > MAX_CHANGE_BYTES) {
     throw new Error("Unified Diff 必须为 1 字节到 1 MiB")
   }
-  if (!Array.isArray(expected_hashes) || expected_hashes.length < 1 || expected_hashes.length > 20) throw new Error("批量补丁需要 1 到 20 个文件版本哈希")
+  if (!Array.isArray(expected_hashes) || expected_hashes.length < 1) throw new Error("批量补丁需要至少一个文件版本哈希")
   const workspace = await requireWorkspace(workspace_id, { writable: true })
   let patches
   try { patches = parsePatch(unified_patch) } catch { throw new Error("Unified Diff 格式无效") }
-  if (patches.length < 1 || patches.length > 20) throw new Error("单次补丁最多处理 20 个文件")
+  if (patches.length < 1) throw new Error("单次补丁至少需要包含一个文件")
 
   const expected = new Map()
   for (const item of expected_hashes) {
@@ -109,59 +128,102 @@ export async function stageUnifiedPatch({ workspace_id, unified_patch, expected_
     expected.set(relative, item.sha256.toLowerCase())
   }
 
-  const plans = []
   const seen = new Set()
-  let proposedBytes = 0
+  const targets = []
   for (const patch of patches) {
     const oldPath = patchPath(patch.oldFileName, "a")
     const newPath = patchPath(patch.newFileName, "b")
     if (oldPath !== newPath) throw new Error("批量补丁不能创建、删除或重命名文件；请使用单独的文件工具")
     if (seen.has(oldPath)) throw new Error(`补丁重复修改同一路径：${oldPath}`)
     seen.add(oldPath)
-    if (isSensitivePath(oldPath)) throw new Error(`拒绝修改受保护的敏感文件：${oldPath}`)
+    if (!isSensitiveAllowed(workspace, oldPath)) throw new Error(`拒绝修改受保护的敏感文件：${oldPath}`)
     if (hasBlockedExplicitDirectory(oldPath)) throw new Error("拒绝修改受保护的内部或生成目录")
     rejectManagedStatePath(workspace, oldPath)
     const expectedHash = expected.get(oldPath)
     if (!expectedHash) throw new Error(`缺少 ${oldPath} 的 read_file SHA-256`)
-    const current = await getText(workspace, oldPath)
-    if (current.hash.toLowerCase() !== expectedHash) throw new Error(`${oldPath} 已变化，请重新读取后生成补丁`)
-    const proposedText = applyPatch(current.text, patch)
-    if (proposedText === false) throw new Error(`补丁无法精确应用到 ${oldPath}`)
-    if (proposedText === current.text) throw new Error(`补丁没有修改 ${oldPath}`)
-    proposedBytes += Buffer.byteLength(proposedText, "utf8")
-    if (proposedBytes > MAX_BATCH_BYTES) throw new Error("批量补丁的总新内容超过 4 MiB 上限")
-    plans.push({ path: oldPath, current, proposedText })
+    targets.push({ patch, path: oldPath, expectedHash })
   }
   if (seen.size !== expected.size || [...expected.keys()].some((relative) => !seen.has(relative))) throw new Error("版本哈希列表必须与补丁中的文件路径完全一致")
 
   const batchId = randomUUID()
   const timestamp = new Date().toISOString()
-  const staged = plans.map(({ path: relative, current, proposedText }) => {
-    const proposed = Buffer.from(proposedText, "utf8")
-    const id = randomUUID()
-    return {
-      id,
-      workspaceId: workspace.id,
-      batchId,
-      path: relative,
-      create: false,
-      expectedHash: current.hash,
-      proposedHash: sha256(proposed),
-      originalBase64: current.bytes.toString("base64"),
-      proposedBase64: proposed.toString("base64"),
-      diff: createTwoFilesPatch(relative, relative, current.text, proposedText, "current", "proposed", { context: 3 }).slice(0, 120_000),
-      status: "pending_approval",
-      createdAt: timestamp,
-      approvedAt: null,
-      appliedAt: null,
+  const staged = []
+  const directResults = []
+  const savedBackupIds = []
+  try {
+    for (const { patch, path: relative, expectedHash } of targets) {
+      const current = await getText(workspace, relative)
+      if (current.hash.toLowerCase() !== expectedHash) throw new Error(`${relative} 已变化，请重新读取后生成补丁`)
+      const proposedText = applyPatch(current.text, patch)
+      if (proposedText === false) throw new Error(`补丁无法精确应用到 ${relative}`)
+      if (proposedText === current.text) throw new Error(`补丁没有修改 ${relative}`)
+      const proposed = Buffer.from(proposedText, "utf8")
+      const proposedHash = sha256(proposed)
+      const diff = createTwoFilesPatch(relative, relative, current.text, proposedText, "current", "proposed", { context: 3 }).slice(0, 120_000)
+
+      if (workspace.mode === "autoWritable") {
+        let backupFileId
+        let result
+        try {
+          backupFileId = await createStagedBlob(current.bytes)
+          savedBackupIds.push(backupFileId)
+        } catch (error) {
+          directResults.push({ path: relative, status: "failed", error: String(error?.message ?? "写入失败").slice(0, 300) })
+          continue
+        }
+        try {
+          const currentWorkspace = await requireWorkspace(workspace_id, { writable: true })
+          if (currentWorkspace.mode !== "autoWritable") throw new Error("工作区权限已变化；未执行此文件的直接补丁")
+          result = await writeExistingFile(currentWorkspace.root, relative, current.hash, proposed)
+        }
+        catch (error) {
+          await discardUploadFiles(backupFileId).catch(() => {})
+          directResults.push({ path: relative, status: "failed", error: String(error?.message ?? "写入失败").slice(0, 300) })
+          continue
+        }
+        const change = {
+          id: randomUUID(), workspaceId: workspace.id, batchId, path: relative, create: false,
+          expectedHash: current.hash, proposedHash, originalBase64: "", proposedBase64: "",
+          backupFileId, diff, status: "applied", createdAt: timestamp, appliedAt: new Date().toISOString(),
+          appliedHash: result.sha256,
+        }
+        await mutateArray("changes", (changes) => { changes.push(change) })
+        await audit("file_patch_direct", { workspaceId: workspace.id, path: relative, itemId: change.id, result: "applied" })
+        directResults.push({ path: relative, status: "applied", sha256_before: current.hash, sha256_after: result.sha256, recovery_id: change.id })
+        continue
+      }
+
+      const originalBlobId = await createStagedBlob(current.bytes)
+      savedBackupIds.push(originalBlobId)
+      const proposedBlobId = await createStagedBlob(proposed)
+      savedBackupIds.push(proposedBlobId)
+      staged.push({
+        id: randomUUID(), workspaceId: workspace.id, batchId, path: relative, create: false,
+        expectedHash: current.hash, proposedHash, originalBase64: "", proposedBase64: "",
+        backupFileId: originalBlobId, proposedBlobId, diff,
+        status: "pending_approval", createdAt: timestamp, approvedAt: null, appliedAt: null,
+      })
     }
-  })
+  } catch (error) {
+    if (workspace.mode !== "autoWritable") for (const blobId of savedBackupIds) await discardUploadFiles(blobId).catch(() => {})
+    throw error
+  }
+
+  if (workspace.mode === "autoWritable") {
+    const appliedCount = directResults.filter((item) => item.status === "applied").length
+    const failureCount = directResults.length - appliedCount
+    return {
+      batch_id: batchId, status: failureCount ? "partial_failure" : "applied", per_file_approval: false,
+      applied_count: appliedCount, failed_count: failureCount,
+      recovery_paths: directResults.filter((item) => item.recovery_id).map((item) => ({ path: item.path, change_id: item.recovery_id })),
+      results: directResults,
+    }
+  }
+
   await mutateArray("changes", (changes) => { changes.push(...staged) })
   for (const item of staged) await audit("change_staged", { workspaceId: workspace.id, path: item.path, itemId: item.id, result: "pending_approval" })
   return {
-    batch_id: batchId,
-    status: "pending_approval",
-    per_file_approval: true,
+    batch_id: batchId, status: "pending_approval", per_file_approval: true,
     changes: staged.map(({ id, path: relative, expectedHash, proposedHash, diff }) => ({ change_id: id, path: relative, sha256_before: expectedHash, sha256_after: proposedHash, diff, status: "pending_approval" })),
   }
 }
@@ -176,13 +238,21 @@ function patchPath(input, expectedPrefix) {
 export async function stageDirectoryCreate({ workspace_id, path }) {
   const workspace = await requireWorkspace(workspace_id, { writable: true })
   const relative = normalizeRelative(path)
-  if (isSensitivePath(relative)) throw new Error("拒绝在受保护的敏感路径创建目录")
+  if (!isSensitiveAllowed(workspace, relative)) throw new Error("拒绝在受保护的敏感路径创建目录；请在本机管理页单独授权")
   if (hasBlockedExplicitDirectory(relative)) throw new Error("拒绝在受保护的内部或生成目录创建新目录")
   rejectManagedStatePath(workspace, relative)
   if (await fileExists(workspace.root, relative)) throw new Error("目标路径已经存在")
   const parentPath = relative.includes("/") ? relative.slice(0, relative.lastIndexOf("/")) : ""
   const parent = await fileInfo(workspace.root, parentPath)
   if (!parent.isDirectory) throw new Error("新目录的父目录不存在或不是目录")
+  if (workspace.mode === "autoWritable") {
+    const currentWorkspace = await requireWorkspace(workspace_id, { writable: true })
+    if (currentWorkspace.mode === "autoWritable") {
+      const result = await createDirectory(currentWorkspace.root, relative)
+      await audit("directory_created_direct", { workspaceId: currentWorkspace.id, path: relative, result: "created" })
+      return { path: relative, status: "applied", requires_local_approval: false, created: result.created }
+    }
+  }
   const id = randomUUID()
   const change = {
     id, workspaceId: workspace.id, path: relative, create: false, createDirectory: true,
@@ -234,6 +304,8 @@ export async function applyChange(id) {
     const proposed = Buffer.from(change.proposedBase64, "base64")
     const result = change.createDirectory
       ? await createDirectory(workspace.root, change.path)
+      : change.uploadedFileId || change.proposedBlobId
+        ? await writeStagedFile(workspace.root, change.path, change.expectedHash, path.join(TMP_DIR, "uploads"), uploadFilePath(change.uploadedFileId ?? change.proposedBlobId))
       : change.create
         ? await createNewFile(workspace.root, change.path, proposed)
         : await writeExistingFile(workspace.root, change.path, change.expectedHash, proposed)
@@ -245,6 +317,8 @@ export async function applyChange(id) {
       item.appliedAt = new Date().toISOString()
       item.appliedHash = result.sha256 ?? null
     })
+    if (change.uploadedFileId) await markUploadApplied(change.uploadedFileId)
+    else if (change.proposedBlobId) await discardUploadFiles(change.proposedBlobId)
     await audit("change_applied", { workspaceId: workspace.id, path: change.path, itemId: id, result: "applied" })
     return { change_id: id, path: change.path, sha256: result.sha256 ?? null, status: "applied" }
   } catch (error) {
@@ -271,11 +345,16 @@ export async function recoverChange(id) {
   })
   try {
     const workspace = await requireWorkspace(change.workspaceId, { writable: true })
-    const current = await getText(workspace, change.path)
-    if (current.hash === change.expectedHash) {
+    const currentHash = change.uploadedFileId ? (await hashFile(workspace.root, change.path)).sha256 : (await getText(workspace, change.path)).hash
+    if (currentHash === change.expectedHash) {
       // The original contents are already present, so no filesystem write is needed.
-    } else if (current.hash === change.proposedHash) {
-      await writeExistingFile(workspace.root, change.path, current.hash, Buffer.from(change.originalBase64, "base64"))
+    } else if (currentHash === change.proposedHash) {
+      if (change.backupFileId) {
+        await writeStagedFile(workspace.root, change.path, currentHash, path.join(TMP_DIR, "uploads"), uploadFilePath(change.backupFileId))
+        await discardUploadFiles(change.backupFileId)
+      } else if (!change.uploadedFileId) {
+        await writeExistingFile(workspace.root, change.path, currentHash, Buffer.from(change.originalBase64, "base64"))
+      } else throw new Error("此上传没有可用的原文件恢复副本")
     } else {
       throw new Error("文件已同时偏离原始版本和 ChatCode 变更版本；为保留用户改动，未覆盖文件")
     }

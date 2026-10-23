@@ -1,10 +1,10 @@
 import assert from "node:assert/strict"
-import { link, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { appendFile, link, mkdtemp, mkdir, readFile, rm, stat, symlink, truncate, writeFile } from "node:fs/promises"
 import { spawn } from "node:child_process"
 import { execFileSync } from "node:child_process"
 import { createServer } from "node:net"
 import path from "node:path"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import { setTimeout as delay } from "node:timers/promises"
 import { test } from "node:test"
@@ -171,10 +171,13 @@ test("MCP stdio: discovery, bounded reads, approvals, file writes, directory cre
     const catalog = await client.listTools()
     const names = new Set(catalog.tools.map((tool) => tool.name))
     const toolMap = new Map(catalog.tools.map((tool) => [tool.name, tool]))
-    for (const name of ["list_workspaces", "read_file", "git_status", "git_diff", "stage_file_write", "stage_unified_patch", "apply_change", "request_project_check", "run_approved_check"]) assert.ok(names.has(name), `missing MCP tool: ${name}`)
+    for (const name of ["list_workspaces", "read_file", "read_file_chunk", "begin_write", "write_chunk", "commit_write", "abort_write", "write_file", "git_status", "git_diff", "stage_file_write", "stage_unified_patch", "apply_change", "request_project_check", "run_approved_check"]) assert.ok(names.has(name), `missing MCP tool: ${name}`)
+    assert.equal(names.has("update_workspace"), false, "MCP must not expose workspace permission changes")
     assert.equal(toolMap.get("read_file").annotations.readOnlyHint, true)
     assert.equal(toolMap.get("stage_file_write").annotations.readOnlyHint, false)
     assert.equal(toolMap.get("apply_change").annotations.destructiveHint, true)
+    assert.equal(toolMap.get("abort_write").annotations.destructiveHint, false)
+    assert.equal(toolMap.get("abort_write").annotations.idempotentHint, true)
 
     const listed = await client.callTool({ name: "list_workspaces", arguments: {} })
     assert.notEqual(listed.isError, true)
@@ -187,6 +190,16 @@ test("MCP stdio: discovery, bounded reads, approvals, file writes, directory cre
     const visible = await client.callTool({ name: "list_files", arguments: { workspace_id: workspaceId, path: "", limit: 20 } })
     assert.ok(visible.structuredContent.entries.some((entry) => entry.name === "README.md"))
     assert.ok(!visible.structuredContent.entries.some((entry) => [".env", ".git", ".tmp", "junction", "node_modules"].includes(entry.name)))
+    await mkdir(path.join(workspaceRoot, "cursor-list"), { recursive: true })
+    for (const name of ["a.txt", "b.txt", "c.txt"]) await writeFile(path.join(workspaceRoot, "cursor-list", name), name, "utf8")
+    const cursorListOne = await client.callTool({ name: "list_files", arguments: { workspace_id: workspaceId, path: "cursor-list", cursor: "", limit: 1 } })
+    assert.equal(cursorListOne.structuredContent.entries.length, 1)
+    assert.ok(cursorListOne.structuredContent.next_cursor)
+    const cursorListTwo = await client.callTool({ name: "list_files", arguments: {
+      workspace_id: workspaceId, path: "cursor-list", cursor: cursorListOne.structuredContent.next_cursor, limit: 1,
+    } })
+    assert.equal(cursorListTwo.structuredContent.entries.length, 1)
+    assert.notEqual(cursorListTwo.structuredContent.entries[0].name, cursorListOne.structuredContent.entries[0].name)
     const read = await client.callTool({ name: "read_file", arguments: { workspace_id: workspaceId, path: "README.md", start_line: 1, line_count: 2 } })
     assert.equal(read.structuredContent.content, "first line\nsecond line")
     assert.match(read.structuredContent.sha256, /^[a-f0-9]{64}$/)
@@ -226,6 +239,40 @@ test("MCP stdio: discovery, bounded reads, approvals, file writes, directory cre
     const regex = await client.callTool({ name: "search_text", arguments: { workspace_id: workspaceId, query: "import.+from", regex: true } })
     assert.notEqual(regex.isError, true)
     assert.equal(regex.structuredContent.matches[0].path, "src/app.ts")
+
+    await writeFile(path.join(workspaceRoot, "search-cursor.txt"), "CURSOR_MATCH one\nCURSOR_MATCH two\nCURSOR_MATCH three\n", "utf8")
+    const searchPageOne = await client.callTool({ name: "search_text", arguments: { workspace_id: workspaceId, query: "CURSOR_MATCH", max_results: 1 } })
+    assert.notEqual(searchPageOne.isError, true, JSON.stringify(searchPageOne))
+    assert.equal(searchPageOne.structuredContent.matches[0].line, 1)
+    assert.ok(searchPageOne.structuredContent.next_cursor)
+    const searchPageTwo = await client.callTool({ name: "search_text", arguments: {
+      workspace_id: workspaceId, query: "CURSOR_MATCH", max_results: 1, cursor: searchPageOne.structuredContent.next_cursor,
+    } })
+    assert.notEqual(searchPageTwo.isError, true, JSON.stringify(searchPageTwo))
+    assert.equal(searchPageTwo.structuredContent.matches[0].line, 2, "text search cursor must resume inside the same file")
+    const searchPageThree = await client.callTool({ name: "search_text", arguments: {
+      workspace_id: workspaceId, query: "CURSOR_MATCH", max_results: 1, cursor: searchPageTwo.structuredContent.next_cursor,
+    } })
+    assert.notEqual(searchPageThree.isError, true, JSON.stringify(searchPageThree))
+    assert.equal(searchPageThree.structuredContent.matches[0].line, 3)
+    const searchPageFour = await client.callTool({ name: "search_text", arguments: {
+      workspace_id: workspaceId, query: "CURSOR_MATCH", max_results: 1, cursor: searchPageThree.structuredContent.next_cursor,
+    } })
+    assert.notEqual(searchPageFour.isError, true, JSON.stringify(searchPageFour))
+    assert.equal(searchPageFour.structuredContent.matches.length, 0)
+    assert.equal(searchPageFour.structuredContent.next_cursor, null)
+
+    for (const name of ["cursor-search-a.txt", "cursor-search-b.txt", "cursor-search-c.txt"]) await writeFile(path.join(workspaceRoot, name), "", "utf8")
+    const filePageOne = await client.callTool({ name: "search_files", arguments: { workspace_id: workspaceId, query: "cursor-search-", max_results: 1 } })
+    assert.notEqual(filePageOne.isError, true, JSON.stringify(filePageOne))
+    assert.equal(filePageOne.structuredContent.matches.length, 1)
+    assert.ok(filePageOne.structuredContent.next_cursor)
+    const filePageTwo = await client.callTool({ name: "search_files", arguments: {
+      workspace_id: workspaceId, query: "cursor-search-", max_results: 1, cursor: filePageOne.structuredContent.next_cursor,
+    } })
+    assert.notEqual(filePageTwo.isError, true, JSON.stringify(filePageTwo))
+    assert.equal(filePageTwo.structuredContent.matches.length, 1)
+    assert.notEqual(filePageTwo.structuredContent.matches[0].path, filePageOne.structuredContent.matches[0].path)
 
     if (junctionAvailable) {
       const junctionRead = await client.callTool({ name: "read_file", arguments: { workspace_id: workspaceId, path: "junction/secret.txt" } })
@@ -351,6 +398,243 @@ test("MCP stdio: discovery, bounded reads, approvals, file writes, directory cre
       if (["cancelled", "timed_out", "failed", "succeeded"].includes(cancelledTask.structuredContent.status)) break
     }
     assert.equal(cancelledTask.structuredContent.status, "cancelled", `${cancelledTask.structuredContent.error ?? "cancellation failed"}\n${cancelledTask.structuredContent.output}`)
+
+    const legacyWorkspace = (await (await fetch(`${adminOrigin}/api/workspaces`)).json()).workspaces.find((item) => item.id === workspaceId)
+    assert.equal(legacyWorkspace.mode, "writable", "legacy writable mode must retain per-item approval")
+    assert.equal((await adminPost(`/api/workspaces/${workspaceId}/auto-write`)).status, 400, "auto-write permission must require explicit local confirmation")
+
+    const originalBinary = Buffer.from([0, 255, 128, 13, 10, 0, 65])
+    const proposedBinary = Buffer.from([255, 0, 1, 2, 128, 0, 66, 10])
+    const approvalBinaryPath = path.join(workspaceRoot, "binary-approval.dat")
+    await writeFile(approvalBinaryPath, originalBinary)
+    const binaryStat = await client.callTool({ name: "stat_file", arguments: { workspace_id: workspaceId, path: "binary-approval.dat", include_sha256: true } })
+    assert.notEqual(binaryStat.isError, true, JSON.stringify(binaryStat))
+    const binaryUpload = await client.callTool({ name: "begin_write", arguments: {
+      workspace_id: workspaceId, path: "binary-approval.dat", size_bytes: String(proposedBinary.length),
+      expected_sha256: binaryStat.structuredContent.sha256, idempotency_key: randomUUID(),
+    } })
+    assert.notEqual(binaryUpload.isError, true, JSON.stringify(binaryUpload))
+    const binaryChunk = await client.callTool({ name: "write_chunk", arguments: {
+      upload_id: binaryUpload.structuredContent.upload_id, offset_bytes: "0", data_base64: proposedBinary.toString("base64"),
+    } })
+    assert.notEqual(binaryChunk.isError, true, JSON.stringify(binaryChunk))
+    const binaryCommit = await client.callTool({ name: "commit_write", arguments: { upload_id: binaryUpload.structuredContent.upload_id } })
+    assert.notEqual(binaryCommit.isError, true, JSON.stringify(binaryCommit))
+    assert.equal(binaryCommit.structuredContent.status, "pending_approval")
+    assert.deepEqual(await readFile(approvalBinaryPath), originalBinary, "approval mode must leave raw target bytes unchanged before approval")
+    assert.equal((await adminPost(`/api/changes/${binaryCommit.structuredContent.change_id}/approve`)).status, 200)
+    const binaryApply = await client.callTool({ name: "apply_change", arguments: { change_id: binaryCommit.structuredContent.change_id } })
+    assert.notEqual(binaryApply.isError, true, JSON.stringify(binaryApply))
+    assert.deepEqual(await readFile(approvalBinaryPath), proposedBinary)
+    assert.equal((await adminPost(`/api/changes/${binaryCommit.structuredContent.change_id}/recover`)).status, 200)
+    assert.deepEqual(await readFile(approvalBinaryPath), originalBinary, "raw upload recovery must restore the exact original bytes")
+
+    const sensitiveDenied = await client.callTool({ name: "read_file", arguments: { workspace_id: workspaceId, path: ".env" } })
+    assert.equal(sensitiveDenied.isError, true)
+    assert.equal((await adminPost(`/api/workspaces/${workspaceId}/sensitive-on`, { confirmSensitive: true })).status, 200)
+    const sensitiveAllowed = await client.callTool({ name: "read_file", arguments: { workspace_id: workspaceId, path: ".env" } })
+    assert.notEqual(sensitiveAllowed.isError, true, JSON.stringify(sensitiveAllowed))
+    assert.match(sensitiveAllowed.structuredContent.content, /CHATCODE_TEST_SECRET/)
+    assert.equal((await adminPost(`/api/workspaces/${workspaceId}/sensitive-off`)).status, 200)
+    assert.equal((await client.callTool({ name: "read_file", arguments: { workspace_id: workspaceId, path: ".env" } })).isError, true)
+
+    const autoResponse = await adminPost(`/api/workspaces/${workspaceId}/auto-write`, { confirmAutoWrite: true })
+    assert.equal(autoResponse.status, 200)
+    const autoWorkspace = (await (await fetch(`${adminOrigin}/api/workspaces`)).json()).workspaces.find((item) => item.id === workspaceId)
+    assert.equal(autoWorkspace.mode, "autoWritable")
+    assert.ok(autoWorkspace.autoWriteGrantedAt)
+
+    const rawBytes = Buffer.from([0, 255, 128, 1, 0, 13, 10, 65, 66])
+    const utf16BomBytes = Buffer.from([0xff, 0xfe, 0x60, 0x4f, 0x7d, 0x59, 0x0d, 0x00, 0x0a, 0x00])
+    const multilingualBytes = Buffer.from("你好，世界 🌏\r\nمرحبا\n", "utf8")
+    for (const name of ["opaque.exe", "opaque.dll", "opaque.apk", "opaque.zip", "opaque.rar", "opaque.7z", "opaque.pdf", "opaque.png", "opaque.jpg", "opaque.docx", "opaque.xlsx", "opaque.pptx", "opaque.mp3", "opaque.mp4", "opaque.db", "opaque.sqlite", "extensionless"]) {
+      const rawWrite = await client.callTool({ name: "write_file", arguments: { workspace_id: workspaceId, path: name, data_base64: rawBytes.toString("base64") } })
+      assert.notEqual(rawWrite.isError, true, `${name}: ${JSON.stringify(rawWrite)}`)
+      assert.equal(rawWrite.structuredContent.status, "applied")
+      assert.deepEqual(await readFile(path.join(workspaceRoot, name)), rawBytes, `${name} must round-trip without decoding`)
+    }
+    const auditLog = await (await fetch(`${adminOrigin}/api/audit`)).json()
+    assert.ok(auditLog.events.some((event) => event.event === "file_written_direct" && event.workspaceId === workspaceId && event.path === "opaque.exe" && event.result === "uploaded"), "direct raw writes must emit an auditable path and result")
+    for (const [name, bytes] of [["one-byte.bin", Buffer.from([0x42])], ["utf16-bom.txt", utf16BomBytes], ["multilingual.txt", multilingualBytes]]) {
+      const result = await client.callTool({ name: "write_file", arguments: { workspace_id: workspaceId, path: name, data_base64: bytes.toString("base64") } })
+      assert.notEqual(result.isError, true, `${name}: ${JSON.stringify(result)}`)
+      assert.deepEqual(await readFile(path.join(workspaceRoot, name)), bytes, `${name} must retain its exact encoding bytes`)
+    }
+
+    const emptyWrite = await client.callTool({ name: "write_file", arguments: { workspace_id: workspaceId, path: "empty.bin", data_base64: "" } })
+    assert.notEqual(emptyWrite.isError, true, JSON.stringify(emptyWrite))
+    assert.equal((await stat(path.join(workspaceRoot, "empty.bin"))).size, 0)
+    const emptyRead = await client.callTool({ name: "read_file_chunk", arguments: { workspace_id: workspaceId, path: "empty.bin", offset_bytes: "0", length_bytes: 1 } })
+    assert.notEqual(emptyRead.isError, true, JSON.stringify(emptyRead))
+    assert.equal(emptyRead.structuredContent.eof, true)
+    assert.equal(emptyRead.structuredContent.bytes_read, 0)
+    for (const offset of ["-1", "9223372036854775808"]) {
+      const invalidRange = await client.callTool({ name: "read_file_chunk", arguments: { workspace_id: workspaceId, path: "empty.bin", offset_bytes: offset, length_bytes: 1 } })
+      assert.equal(invalidRange.isError, true, `invalid 64-bit offset must be rejected: ${offset}`)
+    }
+    const invalidLength = await client.callTool({ name: "read_file_chunk", arguments: { workspace_id: workspaceId, path: "empty.bin", offset_bytes: "0", length_bytes: 0 } })
+    assert.equal(invalidLength.isError, true)
+
+    const interruptedKey = randomUUID()
+    const interruptedStart = await client.callTool({ name: "begin_write", arguments: {
+      workspace_id: workspaceId, path: "interrupted-upload.bin", size_bytes: "2", idempotency_key: interruptedKey,
+    } })
+    assert.notEqual(interruptedStart.isError, true, JSON.stringify(interruptedStart))
+    const resumedStart = await client.callTool({ name: "begin_write", arguments: {
+      workspace_id: workspaceId, path: "interrupted-upload.bin", size_bytes: "2", idempotency_key: interruptedKey,
+    } })
+    assert.notEqual(resumedStart.isError, true, JSON.stringify(resumedStart))
+    assert.equal(resumedStart.structuredContent.upload_id, interruptedStart.structuredContent.upload_id)
+    assert.equal(resumedStart.structuredContent.resumed, true)
+    const interruptedId = interruptedStart.structuredContent.upload_id
+    const { uploadFilePath } = await import("../apps/server/core/uploads.mjs")
+    const invalidBase64 = await client.callTool({ name: "write_chunk", arguments: { upload_id: interruptedId, offset_bytes: "0", data_base64: "AA=Z" } })
+    assert.equal(invalidBase64.isError, true, "malformed Base64 must be rejected")
+    const outOfOrder = await client.callTool({ name: "write_chunk", arguments: { upload_id: interruptedId, offset_bytes: "1", data_base64: "AQ==" } })
+    assert.equal(outOfOrder.isError, true, "out-of-order chunks must be rejected")
+    const firstInterruptedChunk = await client.callTool({ name: "write_chunk", arguments: { upload_id: interruptedId, offset_bytes: "0", data_base64: "AQ==" } })
+    assert.notEqual(firstInterruptedChunk.isError, true, JSON.stringify(firstInterruptedChunk))
+    assert.equal(firstInterruptedChunk.structuredContent.progress_percent, 50)
+    const conflictingRetry = await client.callTool({ name: "write_chunk", arguments: { upload_id: interruptedId, offset_bytes: "0", data_base64: "Ag==" } })
+    assert.equal(conflictingRetry.isError, true, "a retry at the same offset with different bytes must be rejected")
+    await appendFile(uploadFilePath(interruptedId), Buffer.from([0xff]))
+    const recoveredChunk = await client.callTool({ name: "write_chunk", arguments: { upload_id: interruptedId, offset_bytes: "1", data_base64: "Ag==" } })
+    assert.notEqual(recoveredChunk.isError, true, `an uncommitted tail must be truncated to the last confirmed 64-bit offset: ${JSON.stringify(recoveredChunk)}`)
+    const recoveredCommit = await client.callTool({ name: "commit_write", arguments: { upload_id: interruptedId } })
+    assert.notEqual(recoveredCommit.isError, true, JSON.stringify(recoveredCommit))
+    assert.deepEqual(await readFile(path.join(workspaceRoot, "interrupted-upload.bin")), Buffer.from([1, 2]))
+
+    const commitPhaseUpload = await client.callTool({ name: "begin_write", arguments: {
+      workspace_id: workspaceId, path: "commit-phase.bin", size_bytes: "1", idempotency_key: randomUUID(),
+    } })
+    const commitPhaseId = commitPhaseUpload.structuredContent.upload_id
+    const commitPhaseChunk = await client.callTool({ name: "write_chunk", arguments: { upload_id: commitPhaseId, offset_bytes: "0", data_base64: "AQ==" } })
+    assert.notEqual(commitPhaseChunk.isError, true, JSON.stringify(commitPhaseChunk))
+    const commitPhaseMetaPath = path.join(tempDir, "uploads", `${commitPhaseId}.json`)
+    const commitPhaseMeta = JSON.parse(await readFile(commitPhaseMetaPath, "utf8"))
+    commitPhaseMeta.phase = "committing"
+    commitPhaseMeta.commitStartedAt = new Date(Date.now() - 2_000).toISOString()
+    await writeFile(commitPhaseMetaPath, `${JSON.stringify(commitPhaseMeta)}\n`, "utf8")
+    const commitProgress = await (await fetch(`${adminOrigin}/api/uploads`)).json()
+    const committingItem = commitProgress.uploads.find((item) => item.upload_id === commitPhaseId)
+    assert.equal(committingItem.phase, "committing")
+    assert.equal(committingItem.progress_percent, 100)
+    assert.ok(committingItem.phase_elapsed_ms >= 1_000)
+    const commitPhaseAbort = await client.callTool({ name: "abort_write", arguments: { upload_id: commitPhaseId } })
+    assert.notEqual(commitPhaseAbort.isError, true, JSON.stringify(commitPhaseAbort))
+
+    const pausedUpload = await client.callTool({ name: "begin_write", arguments: {
+      workspace_id: workspaceId, path: "paused-upload.bin", size_bytes: "2", idempotency_key: randomUUID(),
+    } })
+    assert.notEqual(pausedUpload.isError, true, JSON.stringify(pausedUpload))
+    const pausedUploadId = pausedUpload.structuredContent.upload_id
+    const pausedFirstChunk = await client.callTool({ name: "write_chunk", arguments: { upload_id: pausedUploadId, offset_bytes: "0", data_base64: "AQ==" } })
+    assert.notEqual(pausedFirstChunk.isError, true, JSON.stringify(pausedFirstChunk))
+    const uploadDashboard = await (await fetch(`${adminOrigin}/api/uploads`)).json()
+    assert.equal(uploadDashboard.uploads.find((item) => item.upload_id === pausedUploadId).received_bytes, "1")
+    assert.equal((await adminPost(`/api/workspaces/${workspaceId}/pause`)).status, 200)
+    const pausedChunk = await client.callTool({ name: "write_chunk", arguments: { upload_id: pausedUploadId, offset_bytes: "1", data_base64: "Ag==" } })
+    assert.equal(pausedChunk.isError, true, "workspace pause must block an in-flight upload")
+    const abortedUpload = await adminPost(`/api/uploads/${pausedUploadId}/abort`)
+    assert.equal(abortedUpload.status, 200)
+    assert.equal((await abortedUpload.json()).status, "aborted")
+    assert.equal((await adminPost(`/api/workspaces/${workspaceId}/resume`)).status, 200)
+
+    const largeBytes = Buffer.alloc(1_048_613)
+    for (let index = 0; index < largeBytes.length; index++) largeBytes[index] = (index * 31 + 7) & 0xff
+    const largeStart = await client.callTool({ name: "begin_write", arguments: {
+      workspace_id: workspaceId, path: "large-roundtrip.bin", size_bytes: String(largeBytes.length), idempotency_key: randomUUID(),
+    } })
+    assert.notEqual(largeStart.isError, true, JSON.stringify(largeStart))
+    const uploadId = largeStart.structuredContent.upload_id
+    for (let offset = 0; offset < largeBytes.length; offset += 262_144) {
+      const part = largeBytes.subarray(offset, Math.min(largeBytes.length, offset + 262_144))
+      const partResult = await client.callTool({ name: "write_chunk", arguments: { upload_id: uploadId, offset_bytes: String(offset), data_base64: part.toString("base64") } })
+      assert.notEqual(partResult.isError, true, JSON.stringify(partResult))
+      if (offset === 0) {
+        const retry = await client.callTool({ name: "write_chunk", arguments: { upload_id: uploadId, offset_bytes: "0", data_base64: part.toString("base64") } })
+        assert.equal(retry.structuredContent.duplicate, true)
+      }
+    }
+    const largeCommit = await client.callTool({ name: "commit_write", arguments: { upload_id: uploadId } })
+    assert.notEqual(largeCommit.isError, true, JSON.stringify(largeCommit))
+    assert.equal(largeCommit.structuredContent.status, "applied")
+    assert.equal(largeCommit.structuredContent.sha256_after, createHash("sha256").update(largeBytes).digest("hex"))
+    assert.deepEqual(await readFile(path.join(workspaceRoot, "large-roundtrip.bin")), largeBytes)
+    const largeStat = await client.callTool({ name: "stat_file", arguments: { workspace_id: workspaceId, path: "large-roundtrip.bin", include_sha256: true } })
+    assert.notEqual(largeStat.isError, true, JSON.stringify(largeStat))
+    assert.equal(largeStat.structuredContent.size_bytes, String(largeBytes.length))
+    const readParts = []
+    let readOffset = 0
+    while (true) {
+      const partResult = await client.callTool({ name: "read_file_chunk", arguments: {
+        workspace_id: workspaceId, path: "large-roundtrip.bin", offset_bytes: String(readOffset),
+        length_bytes: 262_144, expected_version: largeStat.structuredContent.version,
+      } })
+      assert.notEqual(partResult.isError, true, JSON.stringify(partResult))
+      readParts.push(Buffer.from(partResult.structuredContent.data_base64, "base64"))
+      readOffset = Number(partResult.structuredContent.next_offset)
+      if (partResult.structuredContent.eof) break
+    }
+    assert.deepEqual(Buffer.concat(readParts), largeBytes, "chunked raw read must reproduce every byte")
+
+    const textOne = "before one\n"
+    const textTwo = "before two\n"
+    for (const [name, text] of [["patch-one.txt", textOne], ["patch-two.txt", textTwo]]) {
+      const create = await client.callTool({ name: "write_file", arguments: { workspace_id: workspaceId, path: name, data_base64: Buffer.from(text).toString("base64") } })
+      assert.notEqual(create.isError, true, JSON.stringify(create))
+    }
+    const oneStat = await client.callTool({ name: "stat_file", arguments: { workspace_id: workspaceId, path: "patch-one.txt", include_sha256: true } })
+    const twoStat = await client.callTool({ name: "stat_file", arguments: { workspace_id: workspaceId, path: "patch-two.txt", include_sha256: true } })
+    const autoPatch = await client.callTool({ name: "stage_unified_patch", arguments: {
+      workspace_id: workspaceId,
+      unified_patch: createTwoFilesPatch("a/patch-one.txt", "b/patch-one.txt", textOne, "after one\n") + createTwoFilesPatch("a/patch-two.txt", "b/patch-two.txt", textTwo, "after two\n"),
+      expected_hashes: [{ path: "patch-one.txt", sha256: oneStat.structuredContent.sha256 }, { path: "patch-two.txt", sha256: twoStat.structuredContent.sha256 }],
+    } })
+    assert.notEqual(autoPatch.isError, true, JSON.stringify(autoPatch))
+    assert.equal(autoPatch.structuredContent.per_file_approval, false)
+    assert.equal(autoPatch.structuredContent.applied_count, 2)
+    assert.equal(autoPatch.structuredContent.failed_count, 0)
+    assert.equal(await readFile(path.join(workspaceRoot, "patch-one.txt"), "utf8"), "after one\n")
+    for (const item of autoPatch.structuredContent.recovery_paths) assert.equal((await adminPost(`/api/changes/${item.change_id}/recover`)).status, 200)
+    assert.equal(await readFile(path.join(workspaceRoot, "patch-one.txt"), "utf8"), textOne)
+
+    const directCreate = await client.callTool({ name: "stage_file_write", arguments: { workspace_id: workspaceId, path: "direct-edit.txt", content: "direct version\n", create: true } })
+    assert.notEqual(directCreate.isError, true, JSON.stringify(directCreate))
+    assert.equal(directCreate.structuredContent.requires_local_approval, false)
+    const directRead = await client.callTool({ name: "read_file", arguments: { workspace_id: workspaceId, path: "direct-edit.txt" } })
+    const directUpdate = await client.callTool({ name: "stage_replace", arguments: {
+      workspace_id: workspaceId, path: "direct-edit.txt", find: "direct", replace: "automatic", expected_sha256: directRead.structuredContent.sha256,
+    } })
+    assert.notEqual(directUpdate.isError, true, JSON.stringify(directUpdate))
+    assert.equal(directUpdate.structuredContent.requires_local_approval, false)
+    assert.equal(await readFile(path.join(workspaceRoot, "direct-edit.txt"), "utf8"), "automatic version\n")
+    const directDirectory = await client.callTool({ name: "stage_directory_create", arguments: { workspace_id: workspaceId, path: "no-approval-directory" } })
+    assert.notEqual(directDirectory.isError, true, JSON.stringify(directDirectory))
+    assert.equal(directDirectory.structuredContent.requires_local_approval, false)
+    assert.equal((await adminPost(`/api/workspaces/${workspaceId}/pause`)).status, 200)
+    const pausedWrite = await client.callTool({ name: "write_file", arguments: { workspace_id: workspaceId, path: "paused-denied.bin", data_base64: "AA==" } })
+    assert.equal(pausedWrite.isError, true)
+    assert.equal((await adminPost(`/api/workspaces/${workspaceId}/resume`)).status, 200)
+    assert.equal((await adminPost(`/api/workspaces/${workspaceId}/readonly`)).status, 200)
+    const readOnlyWrite = await client.callTool({ name: "write_file", arguments: { workspace_id: workspaceId, path: "readonly-denied.bin", data_base64: "AA==" } })
+    assert.equal(readOnlyWrite.isError, true)
+
+    const sparsePath = path.join(workspaceRoot, "sparse-over-1g.bin")
+    try {
+      const fsutil = path.join(systemRoot, "System32", "fsutil.exe")
+      await writeFile(sparsePath, Buffer.alloc(0))
+      execFileSync(fsutil, ["sparse", "setflag", sparsePath], { windowsHide: true })
+      await truncate(sparsePath, 1_073_741_837)
+      const sparseStat = await client.callTool({ name: "stat_file", arguments: { workspace_id: workspaceId, path: "sparse-over-1g.bin" } })
+      assert.notEqual(sparseStat.isError, true, JSON.stringify(sparseStat))
+      assert.equal(sparseStat.structuredContent.size_bytes, "1073741837")
+      const sparseTail = await client.callTool({ name: "read_file_chunk", arguments: { workspace_id: workspaceId, path: "sparse-over-1g.bin", offset_bytes: "1073741824", length_bytes: 13 } })
+      assert.notEqual(sparseTail.isError, true, JSON.stringify(sparseTail))
+      assert.deepEqual(Buffer.from(sparseTail.structuredContent.data_base64, "base64"), Buffer.alloc(13))
+    } catch (error) {
+      t.diagnostic(`Sparse >1 GiB fixture was not available: ${error.message}`)
+    }
 
     await assert.rejects(() => workspaces.addWorkspace({ name: "forbidden parent", root: "D:\\Download\\GitHub", mode: "readOnly" }), /不能授权/)
   } catch (error) {

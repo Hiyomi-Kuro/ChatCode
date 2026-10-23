@@ -102,24 +102,42 @@ function renderWorkspaces(items) {
   for (const item of items) {
     const card = el("article", "card")
     const head = el("div", "card-head")
+    const modeLabel = item.mode === "autoWritable" ? "可写（无需逐项审批）" : item.mode === "writable" ? "可写（逐项审批）" : "只读"
     head.append(
       el("div", "card-title", item.name),
-      el("span", `badge ${item.status === "active" ? "ok" : ""}`, `${item.status === "active" ? "已启用" : "已暂停"} · ${item.mode === "writable" ? "可写（逐项审批）" : "只读"}`),
+      el("span", `badge ${item.status === "active" ? "ok" : ""}`, `${item.status === "active" ? "已启用" : "已暂停"} · ${modeLabel}`),
     )
     card.append(head, el("div", "meta", `绝对路径：${item.path}`), el("div", "meta", `更新时间：${item.updatedAt ?? "未知"}`))
+    if (item.mode === "autoWritable") card.append(el("div", "meta", `免逐项审批授予时间：${item.autoWriteGrantedAt ?? "旧数据无记录"}`))
+    if (item.allowSensitive) card.append(el("div", "meta", `敏感文件访问已单独授权：${item.sensitiveGrantedAt ?? "旧数据无记录"}`))
     const actions = el("div", "actions")
     actions.append(button("测试访问", async () => {
       const result = await api(`/api/workspaces/${item.id}/test`)
-      showNotice(globalMessage, `目录可访问：${result.path} · ${result.mode === "writable" ? "可写（仍需审批）" : "只读"}`, "ok")
+      const testedMode = result.mode === "autoWritable" ? "可写（无需逐项审批）" : result.mode === "writable" ? "可写（仍需审批）" : "只读"
+      showNotice(globalMessage, `目录可访问：${result.path} · ${testedMode}`, "ok")
     }))
     actions.append(button(item.status === "active" ? "暂停授权" : "恢复授权", async () => {
       await post(`/api/workspaces/${item.id}/${item.status === "active" ? "pause" : "resume"}`)
       await refreshCore()
     }))
-    actions.append(button(item.mode === "writable" ? "设为只读" : "设为可写", async () => {
-      await post(`/api/workspaces/${item.id}/${item.mode === "writable" ? "readonly" : "writable"}`)
+    if (item.mode !== "readOnly") actions.append(button("设为只读", async () => {
+      await post(`/api/workspaces/${item.id}/readonly`)
       await refreshCore()
     }))
+    if (item.mode !== "writable") actions.append(button("设为逐项审批", async () => {
+      await post(`/api/workspaces/${item.id}/writable`)
+      await refreshCore()
+    }, "secondary"))
+    if (item.mode !== "autoWritable") actions.append(button("启用免逐项审批写入", async () => {
+      if (!confirm(`确认对工作区“${item.name}”授予免逐项审批写入？普通文件创建、覆盖、编辑和目录创建不会再经过 ChatCode 本机逐文件审批。ChatGPT 平台确认、授权路径与版本冲突检查仍然生效。`)) return
+      await post(`/api/workspaces/${item.id}/auto-write`, { confirmAutoWrite: true })
+      await refreshCore()
+    }))
+    actions.append(button(item.allowSensitive ? "撤销敏感文件访问" : "单独授权敏感文件访问", async () => {
+      if (!item.allowSensitive && !confirm(`确认允许“${item.name}”工作区访问 .env、密钥、凭据等敏感文件？这些内容不会写入审计日志。`)) return
+      await post(`/api/workspaces/${item.id}/${item.allowSensitive ? "sensitive-off" : "sensitive-on"}`, item.allowSensitive ? {} : { confirmSensitive: true })
+      await refreshCore()
+    }, item.allowSensitive ? "danger" : "secondary"))
     actions.append(button("移除", async () => {
       if (!confirm(`移除工作区“${item.name}”？这只会移除 ChatCode 授权，不会删除目录。`)) return
       await post(`/api/workspaces/${item.id}/remove`)
@@ -197,16 +215,51 @@ function renderTunnelLogs(items) {
   }
 }
 
+function formatBytes(value) {
+  try { return `${BigInt(value).toLocaleString()} bytes` } catch { return `${value} bytes` }
+}
+
+function renderUploads(items, workspaces) {
+  const root = byId("uploads")
+  root.replaceChildren()
+  if (!items.length) return root.append(empty("当前没有进行中的上传。"))
+  const names = new Map(workspaces.map((workspace) => [workspace.id, workspace.name]))
+  for (const item of items) {
+    const card = el("article", "card")
+    const head = el("div", "card-head")
+    const committing = item.phase === "committing"
+    head.append(el("div", "card-title", `${item.path} · ${item.progress_percent}%`), el("span", "badge", committing ? "提交校验中" : "上传中"))
+    const bar = document.createElement("progress")
+    bar.max = 100
+    bar.value = item.progress_percent
+    bar.setAttribute("aria-label", `${committing ? "文件提交校验" : "上传进度"} ${item.progress_percent}%`)
+    card.append(
+      head,
+      el("div", "meta", `工作区：${names.get(item.workspace_id) ?? item.workspace_id}`),
+      el("div", "meta", `已收 ${formatBytes(item.received_bytes)} / ${formatBytes(item.size_bytes)} · ${formatBytes(item.bytes_per_second)}/秒 · ${(item.elapsed_ms / 1000).toFixed(1)} 秒`),
+      el("div", "meta", `最近活动：${item.updated_at} · 空闲过期：${item.expires_at}`),
+      ...(committing ? [el("div", "meta", `数据已收完，正在复核 SHA-256 并原子发布；提交阶段 ${(item.phase_elapsed_ms / 1000).toFixed(1)} 秒。`)] : []),
+      bar,
+    )
+    if (!committing) card.append(button("取消上传", async () => {
+        await post(`/api/uploads/${item.upload_id}/abort`)
+        await refreshCore()
+      }, "danger"))
+    root.append(card)
+  }
+}
+
 async function refreshCore() {
   try {
-    const [workspaces, changes, tasks, audit] = await Promise.all([
-      api("/api/workspaces"), api("/api/changes"), api("/api/tasks"), api("/api/audit"),
+    const [workspaces, changes, tasks, audit, uploads] = await Promise.all([
+      api("/api/workspaces"), api("/api/changes"), api("/api/tasks"), api("/api/audit"), api("/api/uploads"),
     ])
     renderWorkspaces(workspaces.workspaces)
     renderChanges(changes.changes)
     const workspaceNames = new Map(workspaces.workspaces.map((workspace) => [workspace.id, `${workspace.name} · ${workspace.path}`]))
     renderTasks(tasks.tasks.map((task) => ({ ...task, workspaceDisplay: workspaceNames.get(task.workspaceId) ?? task.workspaceId })))
     renderAudit(audit.events)
+    renderUploads(uploads.uploads, workspaces.workspaces)
     setServiceState("connected", `本机服务已连接 · 127.0.0.1:${window.location.port || "80"}`)
     return true
   } catch (error) {
@@ -292,6 +345,7 @@ function renderDiagnostics(data) {
   byId("diagnostics-output").textContent = JSON.stringify({
     management: data.management,
     mcp: data.mcp,
+    safeFs: data.safeFs,
     tunnel: {
       status: data.tunnel.status,
       running: data.tunnel.running,
@@ -361,18 +415,22 @@ workspaceForm.addEventListener("submit", async (event) => {
   const name = workspaceName.value.trim()
   const pathValue = workspacePath.value.trim()
   const mode = workspaceForm.elements.mode.value
+  const confirmAutoWrite = workspaceForm.elements.confirmAutoWrite.checked
+  const allowSensitive = workspaceForm.elements.allowSensitive.checked
   if (!localWindowsPath(pathValue)) return showNotice(byId("workspace-message"), "请输入本机磁盘绝对路径，例如 D:\Projects\Demo；UNC、设备路径和相对路径不受支持。", "bad")
   if (name.length > 64 || /[\r\n\0]/.test(name)) return showNotice(byId("workspace-message"), "显示名称最多 64 个字符，且不能包含换行。", "bad")
-  if (!new Set(["readOnly", "writable"]).has(mode)) return showNotice(byId("workspace-message"), "请选择只读或可写权限。", "bad")
+  if (!new Set(["readOnly", "writable", "autoWritable"]).has(mode)) return showNotice(byId("workspace-message"), "请选择有效工作区权限。", "bad")
+  if (mode === "autoWritable" && !confirmAutoWrite) return showNotice(byId("workspace-message"), "请选择独立确认框，才能授予免逐项审批写入。", "bad")
   const submit = byId("add-workspace")
   submit.disabled = true
   submit.textContent = "正在验证并保存…"
   showNotice(byId("workspace-message"), "正在验证本机路径并保存工作区授权…", "working")
   try {
-    const result = await post("/api/workspaces", { name, path: pathValue, mode })
+    const result = await post("/api/workspaces", { name, path: pathValue, mode, confirmAutoWrite, allowSensitive, confirmSensitive: allowSensitive })
     workspaceForm.reset()
     workspaceName.dataset.edited = "false"
-    showNotice(byId("workspace-message"), `工作区“${result.workspace.name}”已保存（${mode === "writable" ? "可写，文件仍需逐项批准" : "只读"}）。`, "ok")
+    const savedMode = mode === "autoWritable" ? "可写，普通文件不需本机逐项审批" : mode === "writable" ? "可写，文件仍需逐项审批" : "只读"
+    showNotice(byId("workspace-message"), `工作区“${result.workspace.name}”已保存（${savedMode}${allowSensitive ? "；已单独授权敏感文件" : ""}）。`, "ok")
     await refreshCore()
   } catch (error) {
     showNotice(byId("workspace-message"), `添加失败：${error.message}`, "bad")
@@ -514,6 +572,7 @@ byId("copy-diagnostics").addEventListener("click", async () => {
   const safeCopy = {
     management: { status: data.management.status, bind: data.management.bind, port: data.management.port },
     mcp: data.mcp,
+    safeFs: data.safeFs,
     tunnel: {
       status: data.tunnel.status,
       running: data.tunnel.running,

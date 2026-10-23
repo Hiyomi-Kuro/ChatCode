@@ -12,7 +12,8 @@ import { assertRegularFile, ensureLayout } from "./core/state.mjs"
 import { addWorkspace, getWorkspace, listWorkspaces, removeWorkspace, updateWorkspace } from "./core/workspaces.mjs"
 import { approveChange, listChanges, recoverChange, recoverInterruptedChanges } from "./core/changes.mjs"
 import { approveTask, cancelTask, listTasks, markInterruptedTasks } from "./core/tasks.mjs"
-import { fileInfo } from "./core/safe-fs.mjs"
+import { fileInfo, getSafeFsMetrics } from "./core/safe-fs.mjs"
+import { abortWrite, listUploads } from "./core/uploads.mjs"
 import {
   checkTunnelMetadata, deleteRuntimeCredential, detectTunnelClient, diagnoseTunnel, getTunnelRuntimeStatus,
   loadTunnelSettings, loadTunnelSnapshot, recordTunnelEvent, restoreTunnelSnapshot, runtimeCredentialStatus,
@@ -143,6 +144,7 @@ async function route(request, response) {
   }
   if (request.method === "GET" && url.pathname === "/api/session") return sendJson(response, 200, { apiVersion: 2, csrf: csrfToken, origin: ORIGIN, port: PORT })
   if (request.method === "GET" && url.pathname === "/api/workspaces") return sendJson(response, 200, { workspaces: await listWorkspaces() })
+  if (request.method === "GET" && url.pathname === "/api/uploads") return sendJson(response, 200, await listUploads())
   if (request.method === "GET" && url.pathname === "/api/changes") return sendJson(response, 200, { changes: await listChanges() })
   if (request.method === "GET" && url.pathname === "/api/tasks") return sendJson(response, 200, { tasks: await listTasks() })
   if (request.method === "GET" && url.pathname === "/api/audit") {
@@ -156,6 +158,7 @@ async function route(request, response) {
     return sendJson(response, 200, {
       management: { status: "connected", bind: "127.0.0.1", port: PORT, healthUrl: `${ORIGIN}/healthz`, pid: process.pid },
       mcp: mcpLastCheck,
+      safeFs: getSafeFsMetrics(),
       tunnel: { ...tunnel, credentialConfigured: await runtimeCredentialStatus(), clientConfigured: Boolean(settings.clientPath), tunnelIdConfigured: Boolean(settings.tunnelId), profile: settings.profile, profilePath: tunnelProfilePath(settings) },
       chatgpt: { status: "needs_web_confirmation", message: "需在 ChatGPT 网页确认应用注册、工具发现和真实工具调用。" },
       tunnelEvents: loadTunnelSnapshot().events,
@@ -203,10 +206,16 @@ async function route(request, response) {
     return
   }
   if (url.pathname === "/api/workspaces") {
-    const workspace = await addWorkspace({ name: body.name, root: body.path, mode: body.mode })
+    const workspace = await addWorkspace({
+      name: body.name, root: body.path, mode: body.mode,
+      confirmAutoWrite: body.confirmAutoWrite, allowSensitive: body.allowSensitive,
+      confirmSensitive: body.confirmSensitive,
+    })
     return sendJson(response, 201, { workspace })
   }
-  const workspaceAction = /^\/api\/workspaces\/([a-f0-9-]+)\/(pause|resume|readonly|writable|remove)$/.exec(url.pathname)
+  const uploadAbort = /^\/api\/uploads\/([a-f0-9-]{36})\/abort$/i.exec(url.pathname)
+  if (uploadAbort) return sendJson(response, 200, await abortWrite({ upload_id: uploadAbort[1] }))
+  const workspaceAction = /^\/api\/workspaces\/([a-f0-9-]+)\/(pause|resume|readonly|writable|auto-write|sensitive-on|sensitive-off|remove)$/.exec(url.pathname)
   if (workspaceAction) {
     const [, id, action] = workspaceAction
     if (action === "remove") {
@@ -214,7 +223,11 @@ async function route(request, response) {
       return sendJson(response, 200, { removed: true })
     }
     const patch = action === "pause" ? { status: "paused" } : action === "resume" ? { status: "active" }
-      : action === "readonly" ? { mode: "readOnly" } : { mode: "writable" }
+      : action === "readonly" ? { mode: "readOnly" } : action === "writable" ? { mode: "writable" }
+        : action === "auto-write" ? { mode: "autoWritable", confirmAutoWrite: body.confirmAutoWrite }
+          : action === "sensitive-on" ? { allowSensitive: true, confirmSensitive: body.confirmSensitive }
+            : action === "sensitive-off" ? { allowSensitive: false } : null
+    if (!patch) throw new Error("工作区操作无效")
     return sendJson(response, 200, { workspace: await updateWorkspace(id, patch) })
   }
   const changeAction = /^\/api\/changes\/([a-f0-9-]+)\/(approve|recover)$/.exec(url.pathname)

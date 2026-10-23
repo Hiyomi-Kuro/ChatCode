@@ -53,3 +53,13 @@
 - `npm test` 通过：1 个 MCP 集成端到端测试通过，覆盖 Origin/CSRF、防止父子工作区重叠、路径保护、只读和可写授权、Diff 暂存/审批/原子写入/恢复、固定脚本审批执行和取消。
 - 启停验证：旧内存服务被新启动脚本识别为 API 版本不匹配；停止后通过 `scripts\Start-ChatCode.ps1 -NoBrowser` 启动新版本。`/healthz` 返回 `127.0.0.1:39721`，`/api/session` 返回 API v2，页面和模块脚本为 HTTP 200 且 JS MIME 正确。重复启动复用同一 PID；停止脚本确认端口关闭和 runtime marker 清除。随后 `Stop-ChatCode.cmd` 与 `Start-ChatCode.cmd -NoBrowser` 均执行成功；最终 ChatCode 服务保持在线。
 - 外部 Tunnel 和 ChatGPT：未创建真实 Tunnel，未使用用户的真实 Runtime API Key，也未访问 ChatGPT 登录状态。真实 metadata/doctor、Tunnel runtime、ChatGPT 应用安装/工具发现/网页调用均为“未配置/未验证”；不能用本地 stdio 成功替代这些结果。OpenCode Agent 仍未接入，也未执行模型 prompt。
+
+## 第四阶段：三档授权与原始字节分块（2026-10-24）
+
+- 修改范围：本阶段开始时 `D:\Download\GitHub\ChatCode` 的 Git 工作区干净；本阶段的源码、测试和文档变更仅在该仓库内。MCP 和浏览器测试的数据目录、上传块及稀疏文件夹具均使用 `.tmp/tests` 下的隔离目录；测试结束时自动移除本次隔离夹具。现有浏览器证据仍保留在 `.tmp/tests/admin-browser-evidence/`。没有修改其他仓库、现有授权工作区、Tunnel ID 或 Runtime API Key。
+- 工作区模式：MCP 集成验证旧 `writable` 仍创建待审批变更，批准前目标文件不变，批准后应用且可恢复；本机确认后 `autoWritable` 创建、替换、补丁和目录创建直接完成并回报哈希/恢复 ID；暂停与 `readOnly` 状态拒绝写入，MCP 没有授权升权工具。Edge headless 的 `npm run test:browser` 通过，完成 18 项真实浏览器断言，覆盖创建、刷新持久化、逐项审批/免审批/只读切换、暂停/恢复、提交校验阶段提示、确认提示与移除。
+- 原始文件：集成测试验证 0 B、1 B、二进制/NUL、UTF-16 BOM、多语言/CRLF、无扩展名，以及 `.exe`、`.dll`、`.apk`、`.zip`、`.rar`、`.7z`、`.pdf`、`.png`、`.jpg`、`.docx`、`.xlsx`、`.pptx`、`.mp3`、`.mp4`、`.db`、`.sqlite` 的原始字节写回。1,048,613 字节文件经多块上传、提交、SHA-256 校验和分块读取完整往返，测试内容 SHA-256 为 `ded6bc08234e6a4aece8ff14ffc2ac1f662602eaed4472146a5a9ac1a738a4a8`。独立稀疏夹具实测大小 `1,073,741,837` 字节，并成功读取 offset `1,073,741,824` 起的 13 字节尾块；未实际传输 1 GiB 内容，也未占用 1 GiB 磁盘空间。
+- 上传与游标：覆盖相同幂等键续传、最近块重试、模拟崩溃后截断未确认尾块并续写、乱序/冲突重试、非法 Base64、上传进度、提交校验阶段、权限暂停后拒绝续块、本机取消、文件列表 cursor、同一文件内的文本搜索 cursor、文件名搜索 cursor。自动写入审计事件也由集成测试检查。超时操作可安全重试；哈希/原子发布 PowerShell 辅助调用最长 30 分钟，普通辅助调用 30 秒。
+- 自动化结果：最终 `npm test` 通过，1/1 MCP stdio 集成测试、0 失败，历时约 104.5 秒；`npm run test:browser` 通过，18 项断言；本轮改动 JavaScript 的 `node --check` 通过；MCP tools/list 另行确认 `abort_write` 标注为非破坏、可幂等；`git diff --check` 无空白错误（Git 仅提示工作副本 LF/CRLF 转换）。辅助程序样本测量了 canonical-root、文件信息和 SHA-256 三次调用：合计 1,527 ms、平均 509 ms、最大 630 ms、失败 0。该数值是每次 PowerShell 启动与对应文件操作的端到端时间，不是单独进程启动时间。
+- 独立连接器检查：ChatCode 0 的只读 `list_workspaces` 显示四个既有工作区；名为 `ChatCode` 的连接器根目录是单独的 Tunnel/探测目录，不是本次 GitHub 源码仓库。已连接的工具目录仍是旧版，未公布 `read_file_chunk`、`begin_write`、`write_chunk`、`commit_write` 等本轮新增工具，因此不能通过该连接器验证本轮新协议。没有向它或 DSH/WakeUP 写入夹具，也没有重启真实服务或 Tunnel。WinCodex 只读访问 D: 授权根，读取了 `.tmp/tests` 中的 69 字符临时交叉核对文本；随后删除了该唯一临时文件。
+- 未覆盖的运行边界：没有模拟真实磁盘耗尽、第三方持锁时的文件替换、真实网络断线、并发进程竞争或多 GiB 实际数据传输；上传恢复由相同幂等键和分块重试验证。稀疏文件只验证元数据和尾块读取。`search_text` 是 UTF-8 便利搜索，单文件扫描上限 1 MiB、每次扫描预算 16 MiB；更大的文本仍可通过 `read_file_chunk` 无损读取，但搜索便利工具不扫描单个超过 1 MiB 的文件。ChatGPT 网页端工具发现/确认和真实 Tunnel 往返仍未验证。

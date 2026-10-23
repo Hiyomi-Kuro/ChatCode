@@ -8,8 +8,10 @@
 - `scripts/credential-store.ps1` 与 `scripts/select-folder.ps1`：分别用于当前 Windows 用户的 Credential Manager 和用户明确操作的系统文件夹选择器。
 - `apps/server/mcp.mjs`：MCP stdio 服务，由 OpenAI 官方 Secure MCP Tunnel 启动。MCP 参数不包含新增授权目录的能力。
 - `apps/server/core/safe-fs.mjs` 与 `scripts/safe-fs.ps1`：严格解析根内相对路径；Windows 辅助程序使用句柄、最终路径和 reparse 属性检查执行文件操作。
-- `apps/server/core/workspaces.mjs`：独立 workspace ID、暂停/恢复、只读/可写状态及参考仓库排除规则。
-- `apps/server/core/changes.mjs`：按文件版本哈希暂存修改、生成统一 Diff、本机批准后再应用。
+- `apps/server/core/workspaces.mjs`：独立 workspace ID、暂停/恢复、只读、逐项审批、免逐项审批和敏感文件授权；旧 `writable` 数据继续按逐项审批解释。
+- `apps/server/core/files.mjs`：带版本信息的元数据和按字节分页读取；文件类型不依赖解析器。
+- `apps/server/core/uploads.mjs`：有序、可重试、可续传的分块上传；上传字节与小型元数据位于 `.tmp/uploads`，管理页区分传输与 SHA-256/原子发布阶段。
+- `apps/server/core/changes.mjs`：按文件版本哈希暂存修改、生成统一 Diff；大块正文和恢复副本使用临时 blob，不写入大型 JSON 状态。
 - `apps/server/core/tasks.mjs`：固定项目脚本名、任务 ID、审批、状态轮询和取消。
 - `packages/opencode-adapter/adapter.mjs`：可选 OpenCode SDK 生命周期检查；不参与 ChatGPT 原生 MCP 的推理，也不改写上游代码。
 - `data/`：授权、待审批更改、任务元数据和脱敏审计事件。
@@ -21,7 +23,13 @@
 
 ChatGPT 网页版模型完成需求分析与编程决策。模型调用 ChatCode MCP 工具来列举、读取、搜索、暂存修改或请求固定项目检查。真实文件写入和项目脚本执行都要先经过本机管理页批准；服务器端会重新校验 workspace 状态、路径、版本哈希和批准状态。
 
-该路径不调用 OpenAI API，也不需要额外模型 API Key。Secure MCP Tunnel 本身需要由用户在 OpenAI Platform 单独配置 Runtime API Key 和 Tunnel ID。
+该路径不调用 OpenAI API，也不需要额外模型 API Key。只读工作区拒绝写入；旧 `writable` 工作区继续要求本机逐项批准；只有用户在本机管理页明确确认 `autoWritable` 的工作区才允许普通文件直接写入。ChatGPT 平台的工具确认和 workspace 策略仍独立生效。Secure MCP Tunnel 本身需要由用户在 OpenAI Platform 单独配置 Runtime API Key 和 Tunnel ID。
+
+### 按字节传输
+
+`stat_file` 可返回 64 位十进制大小、修改时间、文件版本和可选的流式 SHA-256。`read_file_chunk` 按字节 offset 返回最多 262144 字节 Base64，并附 `next_offset`、EOF 和版本令牌。任意格式可逐块读取；`read_file` 是 UTF-8 预览便利工具，不能替代二进制或超大文件分块读取。
+
+上传由 `begin_write`、`write_chunk`、`commit_write` 和 `abort_write` 组成。块顺序校验、最近一块重试幂等、SHA-256、权限中途撤销复核和 24 小时不活动过期由服务器负责。确认元数据落后于暂存文件时，Windows 辅助程序用 Int64 偏移安全截断未确认尾块，恢复不经过 JavaScript 浮点数。提交时 Windows 辅助程序以流方式把暂存内容复制到目标同目录临时文件，校验并原子发布；现有文件的旧版本经 SHA-256 复核后才替换。上传暂存使用磁盘文件，`data/changes.json` 只保留审批元数据和临时 blob ID。单次 MCP 调用是有界分块，完整文件大小不受应用层 1 MiB 限制；磁盘、文件系统、传输、内存和单次调用超时仍是实际边界。
 
 ### B. OpenCode Agent（尚未接入）
 

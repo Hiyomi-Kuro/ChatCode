@@ -9,7 +9,7 @@ const queues = new Map()
 export async function ensureLayout() {
   await ensurePlainDirectory(DATA_DIR)
   await ensurePlainDirectory(TMP_DIR)
-  for (const child of ["build", "cache", "sessions", "tests", "downloads", "diagnostics", "logs"]) {
+  for (const child of ["build", "cache", "sessions", "tests", "downloads", "diagnostics", "logs", "uploads"]) {
     await ensurePlainDirectory(path.join(TMP_DIR, child))
   }
 }

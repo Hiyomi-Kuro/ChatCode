@@ -2,8 +2,8 @@ import { execFile } from "node:child_process"
 import path from "node:path"
 import { mkdir } from "node:fs/promises"
 import { promisify } from "node:util"
-import { hasBlockedExplicitDirectory, isSensitivePath, normalizeRelative, shouldSkipDirectory } from "./paths.mjs"
-import { isManagedStatePath, rejectManagedStatePath, requireWorkspace } from "./workspaces.mjs"
+import { hasBlockedExplicitDirectory, normalizeRelative, shouldSkipDirectory } from "./paths.mjs"
+import { isManagedStatePath, isSensitiveAllowed, rejectManagedStatePath, requireWorkspace } from "./workspaces.mjs"
 import { canonicalRoot } from "./safe-fs.mjs"
 import { TMP_DIR } from "./config.mjs"
 
@@ -59,7 +59,7 @@ export async function gitDiff({ workspace_id, path }) {
   let relative = null
   if (path) {
     relative = normalizeRelative(path)
-    if (isSensitivePath(relative)) throw new Error("拒绝返回受保护的敏感文件 Git Diff")
+    if (!isSensitiveAllowed(workspace, relative)) throw new Error("拒绝返回受保护的敏感文件 Git Diff；请在本机管理页单独授权")
     if (hasBlockedExplicitDirectory(relative)) throw new Error("拒绝读取受保护的内部或生成目录 Git Diff")
     rejectManagedStatePath(workspace, relative)
     const output = await runGit(workspace, [...baseArgs, "--", relative], 2 * 1024 * 1024)
@@ -74,7 +74,7 @@ export async function gitDiff({ workspace_id, path }) {
     let normalized
     try { normalized = normalizeRelative(candidate) } catch { omitted = true; continue }
     const parts = normalized.split("/")
-    if (isSensitivePath(normalized) || hasBlockedExplicitDirectory(normalized) || parts.slice(0, -1).some(shouldSkipDirectory) || isManagedStatePath(workspace, normalized)) continue
+    if (!isSensitiveAllowed(workspace, normalized) || hasBlockedExplicitDirectory(normalized) || parts.slice(0, -1).some(shouldSkipDirectory) || isManagedStatePath(workspace, normalized)) continue
     if (visible.length >= 50 || pathBytes + normalized.length > 12_000) { omitted = true; continue }
     visible.push(normalized)
     pathBytes += normalized.length

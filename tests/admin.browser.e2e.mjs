@@ -300,7 +300,8 @@ try {
     const nameInput=document.querySelector('#workspace-form [name=name]');
     nameInput.value='Browser Fixture';
     nameInput.dispatchEvent(new Event('input',{bubbles:true}));
-    document.querySelector('#workspace-form [name=mode]').value='readOnly';
+    document.querySelector('#workspace-form [name=mode]').value='autoWritable';
+    document.querySelector('#workspace-form [name=confirmAutoWrite]').checked=true;
     document.querySelector('#workspace-form').requestSubmit();
   })()`)
   const pausedWorkspaceRequest = await workspaceRequestPaused
@@ -317,12 +318,30 @@ try {
   assert.equal(workspaceData.length, 1)
   assert.equal(workspaceData[0].name, "Browser Fixture")
   assert.equal(path.resolve(workspaceData[0].root).toLowerCase(), path.resolve(workspaceRoot).toLowerCase())
-  assert.equal(workspaceData[0].mode, "readOnly")
+  assert.equal(workspaceData[0].mode, "autoWritable")
+  assert.ok(workspaceData[0].autoWriteGrantedAt)
 
   await page.send("Page.reload", { ignoreCache: true })
   await waitPage("document.querySelector('#service')?.dataset.state === 'connected'", "刷新后连接状态恢复")
   await waitPage("document.querySelector('#workspaces')?.textContent.includes('Browser Fixture')", "刷新后工作区从持久状态恢复")
-  record("刷新页面后已授权工作区从 data/workspaces.json 恢复", { count: workspaceData.length, mode: workspaceData[0].mode })
+  record("刷新页面后已授权工作区和免逐项审批授予时间从 data/workspaces.json 恢复", { count: workspaceData.length, mode: workspaceData[0].mode, autoWriteGrantedAt: workspaceData[0].autoWriteGrantedAt })
+
+  const committingUploadId = randomUUID()
+  const uploadDirectory = path.join(serviceTmp, "uploads")
+  await mkdir(uploadDirectory, { recursive: true })
+  const uploadCreated = new Date(Date.now() - 5_000).toISOString()
+  const commitStarted = new Date(Date.now() - 2_000).toISOString()
+  await writeFile(path.join(uploadDirectory, `${committingUploadId}.part`), Buffer.from([0x42]))
+  await writeFile(path.join(uploadDirectory, `${committingUploadId}.json`), `${JSON.stringify({
+    id: committingUploadId, workspaceId: workspaceData[0].id, path: "commit-phase.bin", sizeBytes: "1",
+    expectedHash: null, idempotencyKey: randomUUID(), receivedBytes: "1", lastChunk: null,
+    status: "uploading", phase: "committing", transferCompletedAt: uploadCreated,
+    createdAt: uploadCreated, commitStartedAt: commitStarted, updatedAt: commitStarted,
+  })}\n`, "utf8")
+  await waitPage("document.querySelector('#uploads')?.textContent.includes('提交校验中')", "浏览器显示上传完成后的 SHA-256/原子发布阶段", 20000)
+  assert.match(await pageValue("document.querySelector('#uploads').textContent"), /数据已收完，正在复核 SHA-256 并原子发布/)
+  assert.equal(await pageValue("[...document.querySelectorAll('#uploads button')].some(button=>button.textContent.includes('取消上传'))"), false, "提交校验期间不得显示无法执行的取消按钮")
+  record("上传面板展示提交校验阶段、总耗时与已收字节，且不显示误导性的取消操作", { phase: "committing", cancelVisible: false })
 
   await click("#workspaces .card button")
   await waitPage("document.querySelector('#global-message')?.textContent.includes('目录可访问')", "工作区测试访问反馈")
@@ -330,11 +349,19 @@ try {
   await waitPage("document.querySelector('#workspaces')?.textContent.includes('已暂停')", "暂停工作区授权")
   await page.evaluate(`(() => { const card=[...document.querySelectorAll('#workspaces .card')].find(item=>item.textContent.includes('Browser Fixture')); [...card.querySelectorAll('button')].find(item=>item.textContent.includes('恢复授权')).click(); })()`)
   await waitPage("document.querySelector('#workspaces')?.textContent.includes('已启用')", "恢复工作区授权")
-  await page.evaluate(`(() => { const card=[...document.querySelectorAll('#workspaces .card')].find(item=>item.textContent.includes('Browser Fixture')); [...card.querySelectorAll('button')].find(item=>item.textContent.includes('设为可写')).click(); })()`)
+  await page.evaluate(`(() => { const card=[...document.querySelectorAll('#workspaces .card')].find(item=>item.textContent.includes('Browser Fixture')); [...card.querySelectorAll('button')].find(item=>item.textContent.includes('设为逐项审批')).click(); })()`)
   await waitPage("document.querySelector('#workspaces')?.textContent.includes('可写（逐项审批）')", "工作区权限切换为可写")
+  const autoWriteDialog = page.waitForEvent("Page.javascriptDialogOpening")
+  const autoWriteClick = page.evaluate(`(() => { const card=[...document.querySelectorAll('#workspaces .card')].find(item=>item.textContent.includes('Browser Fixture')); [...card.querySelectorAll('button')].find(item=>item.textContent.includes('启用免逐项审批写入')).click(); })()`)
+  await autoWriteDialog
+  await page.send("Page.handleJavaScriptDialog", { accept: true })
+  await autoWriteClick
+  await waitPage("document.querySelector('#workspaces')?.textContent.includes('可写（无需逐项审批）')", "工作区权限切换为免逐项审批写入")
+  const grantedWorkspace = JSON.parse(await readFile(path.join(dataDir, "workspaces.json"), "utf8"))[0]
+  assert.ok(grantedWorkspace.autoWriteGrantedAt)
   await page.evaluate(`(() => { const card=[...document.querySelectorAll('#workspaces .card')].find(item=>item.textContent.includes('Browser Fixture')); [...card.querySelectorAll('button')].find(item=>item.textContent.includes('设为只读')).click(); })()`)
   await waitPage("document.querySelector('#workspaces')?.textContent.includes('只读')", "工作区权限切回只读")
-  record("工作区暂停、恢复、只读/可写切换和访问测试均由页面按钮触发", { operations: ["test_access", "pause", "resume", "writable", "readOnly"] })
+  record("工作区暂停、恢复、逐项审批/免审批/只读切换和访问测试均由浏览器控件触发", { operations: ["test_access", "pause", "resume", "writable", "autoWritable", "readOnly"] })
 
   await page.evaluate(`(() => { const form=document.querySelector('#workspace-form'); form.elements.name.value='Duplicate Fixture'; form.elements.name.dispatchEvent(new Event('input',{bubbles:true})); form.elements.path.value=${JSON.stringify(workspaceRoot)}; form.elements.path.dispatchEvent(new Event('input',{bubbles:true})); form.requestSubmit(); })()`)
   await waitPage("document.querySelector('#workspace-message')?.classList.contains('bad') && document.querySelector('#workspace-message').textContent.includes('授权冲突')", "重复工作区路径显示可读冲突")

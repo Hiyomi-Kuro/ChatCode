@@ -1,6 +1,7 @@
 import { appendFile } from "node:fs/promises"
 import { assertRegularFile, ensureLayout } from "./state.mjs"
 import { DATA_FILES } from "./config.mjs"
+import { isSensitivePath } from "./paths.mjs"
 
 function clean(value) {
   return String(value ?? "")
@@ -17,7 +18,7 @@ export async function audit(event, details = {}) {
     at: new Date().toISOString(),
     event: clean(event),
     workspaceId: clean(details.workspaceId),
-    path: clean(details.path),
+    path: isSensitivePath(String(details.path ?? "")) ? "[sensitive path]" : clean(details.path),
     itemId: clean(details.itemId),
     result: clean(details.result),
   }

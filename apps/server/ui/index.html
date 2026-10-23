@@ -36,17 +36,22 @@
         <form id="workspace-form" class="workspace-form" method="post" action="/api/workspaces" autocomplete="off">
           <label>显示名称<input name="name" maxlength="64" placeholder="留空时使用文件夹名"></label>
           <label class="path-field">本机目录<div class="path-input"><input name="path" maxlength="2048" placeholder="D:\Projects\Demo" aria-describedby="workspace-path-help"><button id="browse-folder" class="secondary" type="button">浏览文件夹</button></div><span id="workspace-path-help" class="hint">只支持本机磁盘绝对路径。请用 .tmp/tests 中的隔离项目测试。</span></label>
-          <label>权限<select name="mode"><option value="readOnly">只读</option><option value="writable">可写（仍需逐项批准）</option></select></label>
+          <label>权限<select name="mode"><option value="readOnly">只读</option><option value="writable">可写（逐项审批）</option><option value="autoWritable">可写（无需逐项审批）</option></select></label>
+          <label class="checkline"><input name="confirmAutoWrite" type="checkbox">我明确授权此工作区无需本机逐项审批即可创建、覆盖和编辑普通文件</label>
+          <label class="checkline"><input name="allowSensitive" type="checkbox">单独授权此工作区访问敏感文件（例如 .env、密钥和凭据）</label>
+          <p class="permission-note workspace-risk">免逐项审批只移除 ChatCode 本机逐文件确认；ChatGPT 平台确认、工作区策略、路径范围和文件版本检查仍生效。此权限不授权 Shell、Git 破坏性操作或全目录删除。敏感文件权限独立控制，默认关闭。</p>
           <button id="add-workspace" type="submit">添加工作区</button>
         </form>
         <div id="workspace-message" class="notice" role="status" aria-live="polite" hidden></div>
         <div id="workspaces" class="cards"></div>
+        <div class="transfer-heading"><h3>进行中的分块传输</h3><p>显示已收字节、总字节、吞吐、耗时和过期时间；可在本机取消未提交上传。</p></div>
+        <div id="uploads" class="cards"></div>
       </section>
     </section>
 
     <section id="page-changes" class="page" hidden>
       <section class="panel">
-        <div class="section-title"><div><p class="eyebrow">02 / FILE CHANGES</p><h2>文件变更审批</h2></div><p>查看 Diff 后再批准；ChatGPT 仍需调用 apply_change 才会写入文件。</p></div>
+        <div class="section-title"><div><p class="eyebrow">02 / FILE CHANGES</p><h2>文件变更审批与恢复</h2></div><p>逐项审批工作区在此检查 Diff 并批准；免审批工作区的批量更新会显示逐文件结果和恢复操作。</p></div>
         <div id="changes" class="cards"></div>
       </section>
     </section>

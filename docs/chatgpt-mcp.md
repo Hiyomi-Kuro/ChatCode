@@ -8,6 +8,18 @@ Platform Tunnel 权限与 ChatGPT 自定义应用权限是两套授权。创建�
 
 本机服务健康、MCP `tools/list`、Tunnel health 与 ChatGPT 网页端真实调用是四个不同状态。只有 ChatGPT 中实际发现 ChatCode 工具并得到真实调用结果，才能记录网页端连接成功。
 
+## 工作区写入档位和传输工具
+
+- **只读**：服务器拒绝所有文件和目录写入。
+- **可写（逐项审批）**：旧版 `writable` 自动保留此含义。文本修改和大文件上传都进入本机审批队列；本机批准后再调用 `apply_change`。
+- **可写（无需逐项审批）**：只能由本机管理页的显式选择和确认授予。普通文件写入不打开审批页面，但仍检查授权工作区、相对路径、文件版本 SHA-256、原子发布并写审计。此权限不授予 Shell、破坏性 Git 操作或全目录删除，也不绕过 ChatGPT 平台写操作确认。
+
+敏感文件访问是独立的本机授权，默认关闭；MCP 工具不能打开此权限或改变工作区权限。切换只读、暂停或移除工作区会阻止后续写入。
+
+`read_file` 是 UTF-8 预览工具，预览最多读取 1 MiB；它不会让更大的文件变成不可访问。`stat_file` 提供十进制字节大小、版本令牌和可选完整 SHA-256。读取任意格式时，调用 `read_file_chunk` 并用字节 `next_offset` 继续，单块最多 262144 字节。单次响应有界，完整文件由多次工具调用组成。
+
+对小文件可用 `write_file`（最多一个 262144 字节块）。更大的原始文件通过 `begin_write`、按 `next_offset` 顺序多次 `write_chunk`，最后 `commit_write`。已确认的最近一块允许幂等重试；乱序块会拒绝。上传可通过相同 `idempotency_key` 恢复，24 小时无活动后过期；调用 `abort_write` 或在本机管理页取消可清理未提交的上传。审批模式的正文与恢复副本放在 `.tmp/uploads`，持久状态只保留小型元数据。提交会计算 SHA-256 并原子发布；多文件补丁逐个应用，工具返回每项结果和可恢复 ID，不承诺跨文件事务。
+
 ## 配置 ChatCode
 
 1. 安装 Node.js 24 或更高版本及项目依赖，运行 `scripts\\Start-ChatCode.cmd`。在“工作区”页只授权 `.tmp/tests` 下创建的测试项目，并先验证只读 MCP 流程。
@@ -23,7 +35,7 @@ ChatCode 为 `tunnel-client` 设置独立的 `TUNNEL_CLIENT_STATE_DIR`，启动�
 1. 确认 Platform Tunnel 已与目标 ChatGPT workspace 关联，且当前用户具有 `Tunnels Read + Use`。
 2. 在 ChatGPT 的应用设置中打开 **Apps / Connectors**，按当前账号显示的入口启用开发者模式或创建自定义 MCP 应用。选择 **Tunnel** 连接，选取 ChatCode 专属 Tunnel，将应用命名为 `ChatCode` 并安装到目标 workspace。不同计划和 workspace 策略可能隐藏该入口或限制写工具。
 3. 打开对话并选择或提及 `@ChatCode`，先调用 `list_workspaces`，再对测试工作区调用只读 `list_directory`、`read_file` 或 `search_text`。确认返回的路径和内容来自预期测试项目。
-4. 测试写操作时，先让 ChatGPT 调用 `stage_file_write` 或 `stage_unified_patch`。ChatCode 只生成待审批 Diff，不会马上修改文件。用户须在 ChatGPT 允许的写工具确认后，再到本机管理页检查并批准每项；批准后才调用 `apply_change`。
+4. 逐项审批工作区中，ChatGPT 调用 `stage_file_write`、`stage_unified_patch` 或原始字节上传工具；本机用户检查并批准后再调用 `apply_change`。在免逐项审批工作区中，普通文件工具直接执行并返回真实状态和 SHA-256，不会打开逐项审批页面。两种模式都受 ChatGPT 网页写工具确认和工作区策略控制。
 
 如果 Apps、自定义 MCP 或开发者模式入口不可用，请 workspace 管理员检查账号计划、开发者设置、应用策略和写工具限制。不要绕过 ChatGPT 确认，也不要把 Tunnel 正常状态写成网页端调用成功。
 
