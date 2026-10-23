@@ -1,0 +1,10 @@
+{
+  "name": "@chatcode/opencode-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Optional isolated adapter for the published OpenCode SDK",
+  "dependencies": {
+    "@opencode/sdk": "2.1.4"
+  }
+}

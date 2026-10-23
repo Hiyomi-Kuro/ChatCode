@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>ChatCode 本机管理</title>
+  <link rel="stylesheet" href="/admin.css">
+  <script type="module" src="/admin.js"></script>
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">LOCAL CODING BRIDGE</p>
+      <h1>ChatCode</h1>
+      <p class="lede">在本机管理工作区、文件审批、检查任务和 Secure MCP Tunnel 连接。</p>
+    </div>
+    <div class="service-block">
+      <div id="service" class="pill connecting" role="status" aria-live="polite">正在检查本机服务…</div>
+      <button id="retry-connection" class="secondary small-button" type="button">重试连接</button>
+    </div>
+  </header>
+
+  <nav class="main-nav" aria-label="管理页面">
+    <button class="nav-button active" type="button" data-page="workspaces" aria-current="page">工作区</button>
+    <button class="nav-button" type="button" data-page="changes">变更审批</button>
+    <button class="nav-button" type="button" data-page="tasks">项目检查</button>
+    <button class="nav-button" type="button" data-page="settings">连接设置</button>
+    <button class="nav-button" type="button" data-page="logs">运行日志</button>
+  </nav>
+
+  <main>
+    <section id="page-workspaces" class="page">
+      <section class="panel">
+        <div class="section-title"><div><p class="eyebrow">01 / WORKSPACES</p><h2>工作区授权</h2></div><p>手动选择本机项目路径；授权不会开放 MCP 自动添加目录。</p></div>
+        <form id="workspace-form" class="workspace-form" method="post" action="/api/workspaces" autocomplete="off">
+          <label>显示名称<input name="name" maxlength="64" placeholder="留空时使用文件夹名"></label>
+          <label class="path-field">本机目录<div class="path-input"><input name="path" maxlength="2048" placeholder="D:\Projects\Demo" aria-describedby="workspace-path-help"><button id="browse-folder" class="secondary" type="button">浏览文件夹</button></div><span id="workspace-path-help" class="hint">只支持本机磁盘绝对路径。请用 .tmp/tests 中的隔离项目测试。</span></label>
+          <label>权限<select name="mode"><option value="readOnly">只读</option><option value="writable">可写（仍需逐项批准）</option></select></label>
+          <button id="add-workspace" type="submit">添加工作区</button>
+        </form>
+        <div id="workspace-message" class="notice" role="status" aria-live="polite" hidden></div>
+        <div id="workspaces" class="cards"></div>
+      </section>
+    </section>
+
+    <section id="page-changes" class="page" hidden>
+      <section class="panel">
+        <div class="section-title"><div><p class="eyebrow">02 / FILE CHANGES</p><h2>文件变更审批</h2></div><p>查看 Diff 后再批准；ChatGPT 仍需调用 apply_change 才会写入文件。</p></div>
+        <div id="changes" class="cards"></div>
+      </section>
+    </section>
+
+    <section id="page-tasks" class="page" hidden>
+      <section class="panel">
+        <div class="section-title"><div><p class="eyebrow">03 / PROJECT CHECKS</p><h2>项目检查任务</h2></div><p>仅运行固定脚本名；批准前显示 package.json 中的实际命令。</p></div>
+        <div id="tasks" class="cards"></div>
+      </section>
+    </section>
+
+    <section id="page-settings" class="page" hidden>
+      <section class="panel">
+        <div class="section-title"><div><p class="eyebrow">04 / CONNECTION</p><h2>本机与连接状态</h2></div><p>本机服务、MCP、Tunnel 和 ChatGPT 应用分别报告。</p></div>
+        <div id="connection-status" class="status-grid">
+          <article class="status-card"><div class="status-head"><strong>本机 HTTP 服务</strong><span id="http-badge" class="badge">检查中</span></div><p id="http-detail" class="meta">读取本机管理服务状态…</p></article>
+          <article class="status-card"><div class="status-head"><strong>MCP stdio</strong><span id="mcp-badge" class="badge">尚未测试</span></div><p id="mcp-detail" class="meta">本地工具服务可独立测试，不需要 Tunnel 凭据。</p><button id="test-mcp" class="secondary" type="button">测试本机 MCP</button></article>
+          <article class="status-card"><div class="status-head"><strong>Secure MCP Tunnel</strong><span id="tunnel-badge" class="badge">未配置</span></div><p id="tunnel-detail" class="meta">Tunnel 正在使用当前配置检查。</p></article>
+          <article class="status-card"><div class="status-head"><strong>ChatGPT 应用与网页端调用</strong><span id="chatgpt-badge" class="badge">需网页确认</span></div><p id="chatgpt-detail" class="meta">Tunnel 运行不代表 ChatGPT 已注册应用或成功调用工具。</p></article>
+        </div>
+        <div class="actions">
+          <button id="refresh-diagnostics" class="secondary" type="button">刷新连接诊断</button>
+          <button id="copy-diagnostics" class="secondary" type="button">复制脱敏诊断</button>
+        </div>
+        <div id="settings-message" class="notice" role="status" aria-live="polite" hidden></div>
+        <details class="diagnostic-details"><summary>本机诊断详情</summary><pre id="diagnostics-output" class="output">尚未运行诊断。</pre></details>
+      </section>
+
+      <section class="panel">
+        <div class="section-title"><div><p class="eyebrow">05 / TUNNEL PROFILE</p><h2>连接配置</h2></div><p>只连接现有 Tunnel；ChatCode 不会自动创建 Tunnel 或索取高权限管理密钥。</p></div>
+        <div class="protocol-note">
+          <strong>当前模式：本地 stdio MCP + 官方 Secure MCP Tunnel</strong>
+          <p>模型推理由 ChatGPT 网页承担。这里不需要另购模型 API Key。Runtime API Key 只用于 tunnel-client 向 OpenAI Tunnel 控制平面认证。</p>
+        </div>
+        <form id="tunnel-settings-form" class="settings-form" autocomplete="off">
+          <label>Tunnel ID<input name="tunnelId" maxlength="256" placeholder="从 OpenAI Platform 的 Tunnels 页面复制"></label>
+          <label>官方 tunnel-client.exe 绝对路径<input name="clientPath" maxlength="2048" placeholder="例如 D:\Tools\tunnel-client.exe"></label>
+          <label>独立 Profile 标识<input name="profile" maxlength="64" value="chatcode-local" pattern="[a-z0-9][a-z0-9_-]{0,63}"></label>
+          <div class="profile-location"><span class="hint">Profile 文件目录</span><code id="profile-path">保存配置后显示</code></div>
+          <div class="actions settings-actions">
+            <button id="detect-client" class="secondary" type="button">检测客户端</button>
+            <button id="save-settings" type="submit">保存配置</button>
+          </div>
+        </form>
+        <div id="client-message" class="notice" role="status" aria-live="polite" hidden></div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title"><div><p class="eyebrow">06 / RUNTIME KEY</p><h2>Runtime API Key</h2></div><span id="credential-badge" class="badge">未配置</span></div>
+        <p class="hint key-explanation">密钥使用密码输入框，只能录入或替换；保存到 Windows Credential Manager，页面不会回显密钥。密钥不会进入 URL、data 配置、Profile、命令行或日志。</p>
+        <form id="credential-form" class="credential-form" autocomplete="off">
+          <label>录入或替换 Runtime API Key<input name="key" type="password" maxlength="4096" autocomplete="new-password" spellcheck="false" placeholder="粘贴 Runtime API Key"></label>
+          <button id="save-key" type="submit">安全保存密钥</button>
+          <button id="delete-key" class="danger" type="button">删除已保存密钥</button>
+        </form>
+        <p class="permission-note"><strong>权限区别：</strong>运行客户端和读取 Tunnel metadata 使用 Tunnels Read + Use。创建、编辑或删除 Tunnel 需要 Tunnels Read + Manage；这类管理密钥不用于常驻 Tunnel 进程。</p>
+      </section>
+
+      <section class="panel">
+        <div class="section-title"><div><p class="eyebrow">07 / OPERATIONS</p><h2>Tunnel 操作</h2></div><p>同一 Tunnel ID 只运行一个 stdio tunnel-client 实例。</p></div>
+        <div class="actions tunnel-actions">
+          <button id="save-settings-shortcut" class="secondary" type="button">保存配置</button>
+          <button id="check-metadata" class="secondary" type="button">检测凭据与 metadata</button>
+          <button id="run-doctor" class="secondary" type="button">运行 doctor 诊断</button>
+          <button id="start-tunnel" type="button">启动连接</button>
+          <button id="stop-tunnel" class="danger" type="button">断开连接</button>
+        </div>
+        <div id="tunnel-operation-message" class="notice" role="status" aria-live="polite" hidden></div>
+      </section>
+
+      <section class="panel guide-panel">
+        <div class="section-title"><div><p class="eyebrow">08 / CHATGPT SETUP</p><h2>ChatGPT 接入教程</h2></div><p>需要在 OpenAI Platform 和 ChatGPT 网页中由用户完成授权。</p></div>
+        <ol class="guide-steps">
+          <li>在 <a href="https://platform.openai.com/settings/organization/tunnels" target="_blank" rel="noreferrer">OpenAI Platform → Tunnels</a> 创建或选择 ChatCode 专用 Tunnel，并将目标 ChatGPT workspace 与 Platform organization 关联。管理 Tunnel 需要 Tunnels Read + Manage。</li>
+          <li>从 <a href="https://platform.openai.com/settings/organization/api-keys" target="_blank" rel="noreferrer">Runtime API keys</a> 创建单独的运行密钥，授予 Tunnels Read + Use；把密钥粘贴到上方密码框保存。不要使用 OpenAI Admin Key 作为运行密钥。</li>
+          <li>下载官方 Windows 客户端，填写 tunnel-client.exe 路径和 Tunnel ID，保存配置，运行凭据与 metadata 检测，再启动连接。保持 ChatCode 与 tunnel-client 运行。</li>
+          <li>在 <a href="https://chatgpt.com/#settings/Connectors" target="_blank" rel="noreferrer">ChatGPT 设置 → Connectors / Plugins</a> 添加自定义 MCP server，Connection 选择 Tunnel，选择同一 Tunnel，完成风险确认并创建应用“ChatCode”。根据当前界面，可使用“Add custom MCP server”，旧版入口可能显示“Apps → Create”。</li>
+          <li>在新对话中选择或 @提及 ChatCode，调用 <code>list_workspaces</code> 或只读文件工具；只有 ChatGPT 网页中真实发现工具并成功调用后，才算网页端接入完成。</li>
+        </ol>
+        <p class="permission-note">ChatGPT Business、Enterprise/Edu 的自定义 MCP 连接受 workspace 管理员策略控制。Pro 目前只支持受限的只读/搜索能力。若创建入口或写工具被禁用，请联系 workspace 管理员；ChatCode 不会绕过权限，也不会把 Tunnel 健康状态冒充为 ChatGPT 接入成功。</p>
+      </section>
+    </section>
+
+    <section id="page-logs" class="page" hidden>
+      <section class="panel">
+        <div class="section-title"><div><p class="eyebrow">09 / AUDIT</p><h2>最近管理操作</h2></div><p>按时间、操作和结果查看；审计记录不保存文件正文或认证密钥。</p></div>
+        <div id="audit" class="audit-list"></div>
+      </section>
+      <section class="panel">
+        <div class="section-title"><div><p class="eyebrow">10 / TUNNEL LOG</p><h2>Tunnel 诊断记录</h2></div><p>只保存脱敏状态、错误和操作摘要，不记录 MCP 工具参数或文件正文。</p></div>
+        <div id="tunnel-logs" class="audit-list"></div>
+      </section>
+    </section>
+  </main>
+
+  <footer>仅供本机使用 · 管理服务绑定 127.0.0.1 · 仓库文件与工具结果均视为不可信内容</footer>
+</body>
+</html>
