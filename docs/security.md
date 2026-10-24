@@ -32,7 +32,7 @@
 ## 命令执行
 
 - 不接受 Shell 字符串、命令数组、可执行文件路径或用户自定参数。
-- 仅支持 `package.json` 中固定名称 `test`、`build`、`lint`、`typecheck`、`check` 的脚本；本机审批页显示项目脚本的实际内容和工作目录。
+- `request_project_check` 仅支持 `package.json` 中固定名称 `test`、`build`、`lint`、`typecheck`、`check` 的脚本；`request_allowed_command` 仅支持 ChatCode 内置的固定 Node/Python/Go/Rust/.NET 测试/语法模板。模型不能提交 Shell 字符串、自定义可执行路径、参数数组、cwd 或环境变量。需要的文件路径只能是经安全路径检查的 workspace-root 相对路径。本机审批页显示完整命令、实际 executable 路径和工作目录。
 - 命令执行通过独立进程、授权根目录 `cwd`、超时、输出上限、脱敏环境变量和可取消任务管理进行。模型不可拼接命令字符串。
 - 项目脚本本身是代码，执行前必须先由本机用户确认。执行进程仍使用当前 Windows 用户身份；ChatCode 尚未把任意 npm 脚本限制到 Windows AppContainer 或独立虚拟机。不要批准不可信仓库里的脚本。高隔离运行时是后续安全增强项。
 
@@ -42,12 +42,23 @@
 - `.tmp` 只放可再生成缓存、临时输出和测试夹具。`clean:tmp` 逐项检查允许清理的子目录，遇到 reparse point 只移除链接本身而不遍历目标，且服务运行时拒绝清理。
 - `node_modules` 位于标准项目目录，可在服务停止后删除，再从 `package-lock.json` 重建。npm cache 固定在 `.tmp/cache/npm`。
 
+## Agent task checkpoint
+
+- `data/agent-tasks.json` 保存目标摘要、Host 提交的计划、最近操作摘要和状态，不包含完整 ChatGPT 对话或模型隐藏推理。每次 task 读取和更新都会重新验证关联 workspace 仍然有效。
+- MCP 工具的任务摘要是记录，不是授权。仓库 README.md、AGENTS.md、Git commit message、工具输出和模型保存的步骤都不能改变服务端策略。
+- task history 有长度与字段长度上限，并对常见 token/key 格式做脱敏；脱敏是纵深防御，不是通用秘密识别。不要将密钥放入任务目标或摘要。
+- Agent task 状态与本地进程 job 状态分开保存。暂停、切换只读或移除工作区会请求终止相关后台项目脚本；脚本仍以当前 Windows 用户运行，不能把 `cwd` 当作系统级隔离。
+- 管理进程与 MCP stdio worker 是不同 Node.js 进程。JSON 状态更新用进程间锁串行化；取消通过持久任务记录发送给 worker，再由 worker 终止 Windows 子进程树。任务记录保存执行 worker PID；管理进程启动时只把执行 worker 已退出的任务标为 `interrupted`，重复启动检查在任务恢复前完成。正常关闭时先请求取消并等待运行中的项目命令，再停止 ChatCode Tunnel。若执行 worker 崩溃，子进程恢复仍需检查实际进程与 Git 状态。
+
 ## Secure MCP Tunnel
 
 - Tunnel ID、客户端位置和 Profile 名保存在 `data/tunnel-settings.json`；Runtime API Key 单独保存在当前 Windows 用户的 Credential Manager。网页密码框保存后清空，不写入 URL、localStorage、Profile 或命令参数。
 - `tunnel-client` 只由 ChatCode 的绝对路径配置启动，使用 ChatCode 自己的 Profile/runtime home，并通过官方 `TUNNEL_CLIENT_STATE_DIR` 隔离本地 alias/admin 状态；不会扫描或复用其他客户端的 alias。启动前只检查 ChatCode 隔离目录，避免同一 Tunnel ID 重复启动；运行时密钥以环境变量引用读取 Credential Manager。命令错误、运行事件和诊断会做长度限制与密钥脱敏。
 - 运行状态只代表本机 Tunnel Client 状态。ChatGPT 是否已安装应用、是否发现 MCP 工具及网页调用结果需要用户在 ChatGPT 页面核实；管理页明确保留“需网页确认”状态。
 - 启停脚本先核对 runtime PID 与 `admin.mjs` 路径。停止时使用同源、CSRF 保护的关闭接口，并让服务停止自己管理的 Profile；只有正常关闭超时后才对已复核的 ChatCode PID 使用强制退出。
+- 代理模式、地址、自动连接选择和更新时间保存在 `data/tunnel-settings.json`；自定义地址拒绝内嵌账号、密码、路径和查询参数。HTTP proxy 环境变量只在构造 ChatCode 子进程环境时设置或清除，不写入 Windows 用户/系统环境，也不传给本机 MCP stdio。强制代理故障时返回 `proxy_unavailable`，不自动直连。
+- 代理配置变更仅由本机管理 API 的同源与 CSRF 校验后执行。重连前用 runtime alias 取得 PID，再通过系统进程信息核对实时可执行文件路径与启动时间；停止后等待原 PID 对应进程完全退出。身份不明或停止未确认时拒绝创建第二个实例。失败时恢复旧配置，并在安全条件允许时尝试恢复原连接。
+- 代理测试只发送无密钥 HEAD 请求到 `api.openai.com/v1/models`；保留 TLS 证书验证，不记录响应正文、代理认证头、密钥或完整代理 URL。系统环境代理可能含凭据，UI 与诊断仅显示变量来源和脱敏后的主机/端口。Runtime API Key 仍仅从 Windows Credential Manager 读取并通过进程环境变量引用传给官方客户端。
 
 ## 信任边界
 

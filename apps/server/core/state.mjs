@@ -1,10 +1,59 @@
 import { randomUUID } from "node:crypto"
-import { lstat, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises"
+import { lstat, mkdir, open, readFile, realpath, rename, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { rm } from "node:fs/promises"
+import { setTimeout as delay } from "node:timers/promises"
 import { DATA_DIR, DATA_FILES, TMP_DIR } from "./config.mjs"
 
 const queues = new Map()
+
+async function removeStaleLock(lockPath) {
+  try {
+    const stat = await lstat(lockPath)
+    if (!stat.isFile() || isReparse(stat)) throw new Error(`拒绝使用非普通状态锁：${path.basename(lockPath)}`)
+    if (Date.now() - stat.mtimeMs < 60_000) return
+    let lock
+    try { lock = JSON.parse(await readFile(lockPath, "utf8")) } catch { lock = null }
+    let running = false
+    if (Number.isInteger(lock?.pid) && lock.pid > 0) {
+      try { process.kill(lock.pid, 0); running = true } catch (error) { running = error?.code === "EPERM" }
+    }
+    if (!running) {
+      const confirmed = await lstat(lockPath)
+      if (confirmed.isFile() && !isReparse(confirmed) && confirmed.dev === stat.dev && confirmed.ino === stat.ino) {
+        const current = JSON.parse(await readFile(lockPath, "utf8"))
+        if (current.token === lock?.token) await rm(lockPath, { force: true })
+      }
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error
+  }
+}
+
+async function acquireArrayLock(key, file) {
+  const lockPath = `${file}.lock`
+  const token = randomUUID()
+  const deadline = Date.now() + 30_000
+  while (Date.now() < deadline) {
+    try {
+      await assertRegularFile(lockPath, { allowMissing: true })
+      const handle = await open(lockPath, "wx")
+      await handle.writeFile(`${JSON.stringify({ pid: process.pid, token, createdAt: Date.now() })}\n`, "utf8")
+      await handle.close()
+      return async () => {
+        try {
+          const current = JSON.parse(await readFile(lockPath, "utf8"))
+          if (current.token === token && current.pid === process.pid) await rm(lockPath, { force: true })
+        } catch (error) { if (error?.code !== "ENOENT") throw error }
+      }
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error
+      await removeStaleLock(lockPath)
+      await delay(25)
+    }
+  }
+  throw new Error(`等待 ${key} 状态文件锁超时`)
+}
 
 export async function ensureLayout() {
   await ensurePlainDirectory(DATA_DIR)
@@ -76,10 +125,17 @@ export async function writeArray(key, value) {
 export function mutateArray(key, mutate) {
   const previous = queues.get(key) ?? Promise.resolve()
   const operation = previous.catch(() => {}).then(async () => {
-    const value = await readArray(key)
-    const result = await mutate(value)
-    await writeArray(key, value)
-    return result
+    await ensureLayout()
+    const file = DATA_FILES[key]
+    const release = await acquireArrayLock(key, file)
+    try {
+      const latest = await readArray(key)
+      const result = await mutate(latest)
+      await writeArray(key, latest)
+      return result
+    } finally {
+      await release()
+    }
   })
   queues.set(key, operation)
   return operation

@@ -176,6 +176,7 @@ let admin
 let edge
 let page
 let browser
+let proxyMock
 let adminOutput = ""
 let edgeOutput = ""
 let sessionToken = ""
@@ -398,6 +399,50 @@ try {
   await waitPage("document.querySelector('#http-badge')?.textContent === '已连接'", "连接设置显示真实管理服务状态")
   const localHttp = await pageValue("document.querySelector('#http-detail').textContent")
   assert.ok(localHttp.includes(String(port)))
+  assert.equal(await pageValue("document.querySelector('#proxy-mode')?.value"), "direct")
+  assert.equal(await pageValue("document.querySelector('#proxy-url')?.value"), "http://127.0.0.1:9910")
+  assert.ok(await pageValue("Boolean(document.querySelector('#proxy-test-port') && document.querySelector('#proxy-test-openai') && document.querySelector('#proxy-apply'))"))
+  const proxyCsrf = await fetch(`${origin}/api/tunnel/proxy/apply`, {
+    method: "POST", headers: { Origin: origin, "X-ChatCode-CSRF": "invalid", "Content-Type": "application/json" },
+    body: JSON.stringify({ proxyMode: "custom", proxyUrl: "http://127.0.0.1:9910", autoStart: false }),
+  })
+  assert.equal(proxyCsrf.status, 403, "proxy settings must use the same Origin/CSRF guard")
+  record("代理设置默认值与操作控件在连接设置显示，配置变更仍要求有效 CSRF", { defaultMode: "direct", defaultAddress: "http://127.0.0.1:9910", badCsrf: proxyCsrf.status })
+
+  let connectRequest = ""
+  proxyMock = net.createServer((socket) => {
+    let request = ""
+    socket.on("data", (chunk) => {
+      request += chunk.toString("latin1")
+      if (!request.includes("\r\n\r\n")) return
+      connectRequest = request
+      socket.end("HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
+    })
+  })
+  await new Promise((resolve, reject) => proxyMock.once("error", reject).listen(0, "127.0.0.1", resolve))
+  const mockProxyUrl = `http://127.0.0.1:${proxyMock.address().port}`
+  await fill("#proxy-mode", "custom", "change")
+  await fill("#proxy-url", mockProxyUrl)
+  await click("#proxy-test-port")
+  await waitPage("document.querySelector('#proxy-message')?.textContent.includes('代理端口可连接')", "代理端口测试回执")
+  await click("#proxy-test-openai")
+  await waitPage("document.querySelector('#proxy-message')?.textContent.includes('代理要求认证')", "代理 CONNECT 407 分类与限时回执", 10000)
+  assert.match(connectRequest, /^CONNECT api\.openai\.com:443 HTTP\/1\.1\r\n/)
+  record("真实管理页代理按钮完成 TCP 与 OpenAI CONNECT 测试，准确分类 mock 407 且不显示凭据", { connectTarget: "api.openai.com:443", result: "proxy_auth_failure" })
+  await click("#proxy-apply")
+  await waitPage("!document.querySelector('#proxy-apply').disabled && document.querySelector('#proxy-message')?.textContent.includes('代理要求认证')", "拒绝认证失败的代理并保持旧配置", 10000)
+  const failedApplySettings = await page.evaluate("(async()=>{const r=await(await fetch('/api/tunnel/settings',{cache:'no-store'})).json();return{proxyMode:r.settings.proxyMode,autoStart:r.settings.autoStart}})()")
+  assert.equal(failedApplySettings.proxyMode, "direct")
+  assert.equal(failedApplySettings.autoStart, false)
+  record("自定义代理预检遇到 407 时不提交配置并保留先前直连设置", { proxyMode: failedApplySettings.proxyMode, autoStart: failedApplySettings.autoStart })
+  await page.evaluate("(() => { const input=document.querySelector('#proxy-auto-start'); input.checked=false; input.dispatchEvent(new Event('change',{bubbles:true})); })()")
+  await click("#proxy-disable")
+  await waitPage("document.querySelector('#proxy-message')?.textContent.includes('代理设置已保存')", "禁用代理动作保存并返回状态")
+  const savedProxySettings = JSON.parse(await readFile(path.join(dataDir, "tunnel-settings.json"), "utf8"))
+  assert.equal(savedProxySettings.proxyMode, "direct")
+  assert.equal(savedProxySettings.autoStart, false)
+  record("禁用代理操作通过同源管理 UI 持久化直连和自动连接选择", { proxyMode: savedProxySettings.proxyMode, autoStart: savedProxySettings.autoStart })
+
   await click("#test-mcp")
   await waitPage("document.querySelector('#mcp-badge')?.textContent.startsWith('已验证')", "本机 MCP stdio 真实工具调用完成", 20000)
   record("设置页通过 StdioClientTransport 发现工具并实际调用 list_workspaces", { detail: await pageValue("document.querySelector('#mcp-detail').textContent") })
@@ -501,6 +546,7 @@ try {
     } catch { /* browser may have closed */ }
   }
 } finally {
+  try { if (proxyMock?.listening) await new Promise((resolve) => proxyMock.close(resolve)) } catch { /* local test proxy cleanup */ }
   try { await shutdownAdmin() } catch { /* the service may have crashed */ }
   try { await page?.close() } catch { /* isolated browser cleanup continues */ }
   try {

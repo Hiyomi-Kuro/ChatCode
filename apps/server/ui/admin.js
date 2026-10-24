@@ -1,6 +1,7 @@
 let csrf = ""
 let sessionReady = false
 let diagnosticsData = null
+let proxyFormTouched = false
 
 const byId = (id) => document.getElementById(id)
 const api = async (url, options = {}) => {
@@ -20,7 +21,11 @@ const api = async (url, options = {}) => {
     if (!contentType.toLowerCase().includes("application/json")) throw new Error(`本机服务返回了非 JSON 响应（HTTP ${response.status}）。请检查服务版本并重试。`)
     let data
     try { data = await response.json() } catch { throw new Error(`本机服务的 JSON 响应无效（HTTP ${response.status}）。`) }
-    if (!response.ok) throw new Error(data?.error ?? `本机请求失败（HTTP ${response.status}）。`)
+    if (!response.ok) {
+      const error = new Error(data?.error ?? `本机请求失败（HTTP ${response.status}）。`)
+      error.code = data?.code ?? "request_failed"
+      throw error
+    }
     return data
   } catch (error) {
     if (error?.name === "AbortError") throw new Error(`本机请求超过 ${Math.round(timeoutMs / 1000)} 秒，请重试。`)
@@ -35,6 +40,7 @@ const post = (url, body = {}, timeoutMs = 12000) => api(url, { method: "POST", b
 const sessionControlIds = [
   "browse-folder", "add-workspace", "test-mcp", "detect-client", "save-settings", "save-key", "delete-key",
   "save-settings-shortcut", "check-metadata", "run-doctor", "start-tunnel", "stop-tunnel", "refresh-diagnostics", "copy-diagnostics",
+  "proxy-test-port", "proxy-test-openai", "proxy-apply", "proxy-disable", "proxy-copy-diagnostics",
 ]
 function enableSessionControls(enabled) {
   for (const id of sessionControlIds) if (byId(id)) byId(id).disabled = !enabled
@@ -177,18 +183,53 @@ function renderChanges(items) {
 function renderTasks(items) {
   const root = byId("tasks")
   root.replaceChildren()
-  if (!items.length) return root.append(empty("没有项目脚本任务。"))
+  if (!items.length) return root.append(empty("没有本地命令任务。"))
   for (const item of items.slice(0, 30)) {
     const card = el("article", "card")
     const head = el("div", "card-head")
     head.append(el("div", "card-title", `${item.command} · ${item.id}`), el("span", `badge ${item.status === "succeeded" ? "ok" : ["failed", "timed_out", "cancelled", "interrupted"].includes(item.status) ? "bad" : ""}`, item.status))
     card.append(head, el("div", "meta", `工作区：${item.workspaceDisplay ?? item.workspaceId} · 请求时间：${item.requestedAt}`))
-    card.append(el("pre", "script", item.scriptPreview ?? ""))
-    if (item.status === "awaiting_approval") card.append(button("批准运行此项目脚本", async () => { await post(`/api/tasks/${item.id}/approve`); await refreshCore() }, ""))
-    if (item.status === "approved") card.append(el("div", "meta", "本机已批准。ChatGPT 可以调用 run_approved_check 启动。"))
+    card.append(el("pre", "script", item.displayPreview ?? item.scriptPreview ?? ""))
+    if (item.status === "awaiting_approval") card.append(button(item.kind === "allowed_command" ? "批准运行此固定命令" : "批准运行此项目脚本", async () => { await post(`/api/tasks/${item.id}/approve`); await refreshCore() }, ""))
+    if (item.status === "approved") card.append(el("div", "meta", item.kind === "allowed_command" ? "本机已批准。ChatGPT 可以调用 run_approved_command 启动。" : "本机已批准。ChatGPT 可以调用 run_approved_check 启动。"))
     if (["running", "starting"].includes(item.status)) card.append(button("取消任务", async () => { await post(`/api/tasks/${item.id}`, { action: "cancel" }); await refreshCore() }, "danger"))
     if (item.error) card.append(el("div", "meta", `错误：${item.error}`))
     if (item.output) card.append(el("pre", "output", item.output))
+    root.append(card)
+  }
+}
+
+function renderAgentTasks(items) {
+  const root = byId("agent-tasks")
+  root.replaceChildren()
+  if (!items.length) return root.append(empty("尚无 ChatGPT 驱动任务。"))
+  for (const item of items.slice(0, 30)) {
+    const card = el("article", "card")
+    const head = el("div", "card-head")
+    head.append(el("div", "card-title", `${item.user_goal} · ${item.id}`), el("span", `badge ${item.status === "completed" ? "ok" : ["failed", "cancelled"].includes(item.status) ? "bad" : ""}`, item.status))
+    card.append(head, el("div", "meta", `工作区：${item.workspaceDisplay ?? item.workspace_id} · revision ${item.revision} · 更新：${item.updated_at}`))
+    if (item.plan?.length) {
+      const plan = el("ol", "agent-plan")
+      for (const step of item.plan) {
+        const row = el("li", "")
+        row.append(el("strong", "", `[${step.status}] ${step.title}`))
+        if (step.result_summary) row.append(el("div", "meta", step.result_summary))
+        plan.append(row)
+      }
+      card.append(plan)
+    }
+    if (item.local_jobs?.length) {
+      const jobs = el("div", "agent-history")
+      for (const job of item.local_jobs) jobs.append(el("div", "audit-row", `本机 job ${job.id} · ${job.script} · ${job.status}${job.exit_code === null || job.exit_code === undefined ? "" : ` · exit ${job.exit_code}`}`))
+      card.append(jobs)
+    }
+    if (item.last_observation) card.append(el("pre", "output", item.last_observation))
+    const history = item.history?.slice(-8) ?? []
+    if (history.length) {
+      const events = el("div", "agent-history")
+      for (const event of history) events.append(el("div", "audit-row", `${event.at} · ${event.event} · ${event.summary}`))
+      card.append(events)
+    }
     root.append(card)
   }
 }
@@ -251,13 +292,14 @@ function renderUploads(items, workspaces) {
 
 async function refreshCore() {
   try {
-    const [workspaces, changes, tasks, audit, uploads] = await Promise.all([
-      api("/api/workspaces"), api("/api/changes"), api("/api/tasks"), api("/api/audit"), api("/api/uploads"),
+    const [workspaces, changes, tasks, agentTasks, audit, uploads] = await Promise.all([
+      api("/api/workspaces"), api("/api/changes"), api("/api/tasks"), api("/api/agent-tasks"), api("/api/audit"), api("/api/uploads"),
     ])
     renderWorkspaces(workspaces.workspaces)
     renderChanges(changes.changes)
     const workspaceNames = new Map(workspaces.workspaces.map((workspace) => [workspace.id, `${workspace.name} · ${workspace.path}`]))
     renderTasks(tasks.tasks.map((task) => ({ ...task, workspaceDisplay: workspaceNames.get(task.workspaceId) ?? task.workspaceId })))
+    renderAgentTasks(agentTasks.tasks.map((task) => ({ ...task, workspaceDisplay: workspaceNames.get(task.workspace_id) ?? task.workspace_id })))
     renderAudit(audit.events)
     renderUploads(uploads.uploads, workspaces.workspaces)
     setServiceState("connected", `本机服务已连接 · 127.0.0.1:${window.location.port || "80"}`)
@@ -334,12 +376,43 @@ function statusFromTunnel(value) {
   setBadge(byId("credential-badge"), configured ? "ok" : "", configured ? "已安全保存" : "未配置")
 }
 
+function renderProxyStatus(proxy) {
+  if (!proxy) return
+  const labels = {
+    healthy: ["ok", "已由代理建立控制平面连接"],
+    direct: ["", "Tunnel 直连"],
+    disconnected: ["", "Tunnel 未连接"],
+    connecting: ["working", "代理来源未确认"],
+    reconnecting: ["working", "Tunnel 正在重连"],
+    tunnel_still_direct: ["bad", "Tunnel 仍在直连"],
+    proxy_unavailable: ["bad", "代理未运行"],
+    api_unreachable: ["bad", "OpenAI API 不可达"],
+    proxy_auth_failure: ["bad", "代理认证失败"],
+    tls_error: ["bad", "TLS 证书验证失败"],
+    platform_rate_limited: ["bad", "OpenAI API 返回 429"],
+    proxy_not_configured: ["", "系统代理未配置"],
+  }
+  const [kind, label] = labels[proxy.state] ?? ["", proxy.state ?? "状态未知"]
+  setBadge(byId("proxy-status-badge"), kind, label)
+  byId("proxy-status-detail").textContent = proxy.message ?? "尚无代理诊断。"
+  const lastOpenAi = proxy.lastOpenAiTest
+  const lines = [
+    `模式：${proxy.mode ?? "未知"} · 来源：${proxy.source ?? "未知"} · 地址：${proxy.address ?? "未配置"}`,
+    `Tunnel：${proxy.running ? "运行中" : "已停止"} · healthy=${Boolean(proxy.healthy)} · ready=${Boolean(proxy.ready)} · poll=${proxy.pollHealthState ?? "unknown"}`,
+    `最近成功 poll：${proxy.lastSuccessfulPollAt ?? "客户端未提供时间"} · metadata：${proxy.lastMetadataAt ?? "尚未成功"}`,
+    `最近 metadata 尝试：${proxy.lastMetadataAttemptAt ?? "尚未运行"} · 失败类别：${proxy.lastMetadataError || "无"}`,
+    lastOpenAi ? `OpenAI：${lastOpenAi.status} · HTTP ${lastOpenAi.httpStatus ?? "—"} · TCP ${lastOpenAi.timings?.tcpMs ?? lastOpenAi.tcpMs ?? "—"} ms · CONNECT ${lastOpenAi.timings?.connectMs ?? lastOpenAi.connectMs ?? "—"} ms · TLS ${lastOpenAi.timings?.tlsMs ?? lastOpenAi.tlsMs ?? "—"} ms · HTTP ${lastOpenAi.timings?.httpMs ?? lastOpenAi.httpMs ?? "—"} ms` : "OpenAI 网络测试：尚未运行",
+  ]
+  byId("proxy-metrics").textContent = lines.join("\n")
+}
+
 function renderDiagnostics(data) {
   diagnosticsData = data
   setBadge(byId("http-badge"), "ok", "已连接")
   byId("http-detail").textContent = `监听地址：${data.management.bind}:${data.management.port} · 健康检查：${data.management.healthUrl} · PID ${data.management.pid}`
   statusFromMcp(data.mcp)
   statusFromTunnel(data.tunnel)
+  renderProxyStatus(data.proxy)
   setBadge(byId("chatgpt-badge"), "", "需网页确认")
   byId("chatgpt-detail").textContent = data.chatgpt.message
   byId("diagnostics-output").textContent = JSON.stringify({
@@ -358,6 +431,7 @@ function renderDiagnostics(data) {
       message: data.tunnel.message,
       lastError: data.tunnel.lastError,
     },
+    proxy: data.proxy,
     chatgpt: data.chatgpt,
     tunnelEvents: data.tunnelEvents,
   }, null, 2)
@@ -371,6 +445,12 @@ async function refreshSettings() {
     form.elements.tunnelId.value = saved.settings.tunnelId
     form.elements.clientPath.value = saved.settings.clientPath
     form.elements.profile.value = saved.settings.profile
+    if (!proxyFormTouched) {
+      byId("proxy-mode").value = saved.settings.proxyMode ?? "direct"
+      byId("proxy-url").value = saved.settings.proxyUrl ?? "http://127.0.0.1:9910"
+      byId("proxy-auto-start").checked = saved.settings.autoStart === true
+      byId("proxy-url-label").hidden = byId("proxy-mode").value !== "custom"
+    }
     byId("profile-path").textContent = saved.profilePath
     setBadge(byId("credential-badge"), saved.credentialConfigured ? "ok" : "", saved.credentialConfigured ? "已安全保存" : "未配置")
     renderDiagnostics(diagnostics)
@@ -555,7 +635,7 @@ async function runTunnelOperation(buttonId, endpoint, pending, success) {
     showNotice(byId("tunnel-operation-message"), result.message ?? success, result.status === "error" ? "bad" : "ok")
     await refreshSettings()
   } catch (error) {
-    showNotice(byId("tunnel-operation-message"), `${error.message}`, "bad")
+    showNotice(byId("tunnel-operation-message"), `${error.message}${error.code ? `（${error.code}）` : ""}`, "bad")
     await refreshSettings()
   } finally { buttonNode.disabled = false }
 }
@@ -566,7 +646,76 @@ byId("start-tunnel").addEventListener("click", () => { void runTunnelOperation("
 byId("stop-tunnel").addEventListener("click", () => { void runTunnelOperation("stop-tunnel", "/api/tunnel/stop", "正在停止 ChatCode 管理的 Tunnel…", "Tunnel 已断开。") })
 byId("refresh-diagnostics").addEventListener("click", () => { void refreshSettings() })
 
-byId("copy-diagnostics").addEventListener("click", async () => {
+const proxyMode = byId("proxy-mode")
+const proxyUrl = byId("proxy-url")
+const proxyAutoStart = byId("proxy-auto-start")
+let lastSelectedProxyMode = proxyMode.value
+proxyMode.addEventListener("change", () => {
+  proxyFormTouched = true
+  byId("proxy-url-label").hidden = proxyMode.value !== "custom"
+  if (proxyMode.value === "custom" && lastSelectedProxyMode !== "custom" && proxyAutoStart.dataset.touched !== "true") proxyAutoStart.checked = true
+  lastSelectedProxyMode = proxyMode.value
+})
+proxyUrl.addEventListener("input", () => { proxyFormTouched = true })
+proxyAutoStart.addEventListener("change", () => { proxyFormTouched = true; proxyAutoStart.dataset.touched = "true" })
+
+function currentProxyForm() {
+  return { proxyMode: proxyMode.value, proxyUrl: proxyUrl.value.trim(), autoStart: proxyAutoStart.checked }
+}
+
+async function refreshDiagnosticsOnly() {
+  const diagnostics = await api("/api/diagnostics")
+  renderDiagnostics(diagnostics)
+}
+
+byId("proxy-test-port").addEventListener("click", async () => {
+  const button = byId("proxy-test-port")
+  button.disabled = true
+  showNotice(byId("proxy-message"), "正在测试当前所选代理的 TCP 端口…", "working")
+  try {
+    const result = await post("/api/tunnel/proxy/test-port", currentProxyForm(), 7000)
+    showNotice(byId("proxy-message"), result.message, result.status === "reachable" ? "ok" : "bad")
+    await refreshDiagnosticsOnly()
+  } catch (error) { showNotice(byId("proxy-message"), error.message, "bad") }
+  finally { button.disabled = false }
+})
+
+byId("proxy-test-openai").addEventListener("click", async () => {
+  const button = byId("proxy-test-openai")
+  button.disabled = true
+  showNotice(byId("proxy-message"), "正在检查 TCP、HTTP CONNECT、TLS 与 OpenAI API 响应…", "working")
+  try {
+    const result = await post("/api/tunnel/proxy/test-openai", currentProxyForm(), 20000)
+    const detail = result.httpStatus ? ` HTTP ${result.httpStatus}。` : ""
+    showNotice(byId("proxy-message"), `${result.message}${detail}`, result.status === "api_reachable" ? "ok" : result.status === "platform_rate_limited" ? "working" : "bad")
+    await refreshDiagnosticsOnly()
+  } catch (error) { showNotice(byId("proxy-message"), error.message, "bad") }
+  finally { button.disabled = false }
+})
+
+async function applyProxy(mode = proxyMode.value) {
+  if (!sessionReady) return showNotice(byId("proxy-message"), "安全会话尚未连接，代理设置未提交。", "bad")
+  const button = byId(mode === "direct" ? "proxy-disable" : "proxy-apply")
+  button.disabled = true
+  showNotice(byId("proxy-message"), mode === "direct" ? "正在禁用代理并安全重连 ChatCode Tunnel…" : "正在验证代理、停止旧实例并安全重连 ChatCode Tunnel…", "working")
+  try {
+    const result = await post("/api/tunnel/proxy/apply", { ...currentProxyForm(), proxyMode: mode }, 125000)
+    const connection = result.proxy?.state === "healthy" ? "控制平面已通过代理就绪" : result.reconnect === "not_started" ? "配置已保存；Tunnel 保持停止状态" : result.runtime?.message ?? "Tunnel 已重连"
+    const rateLimit = result.proxy?.lastOpenAiTest?.status === "platform_rate_limited" ? " OpenAI API 检查返回 429，但 Tunnel 和 ChatGPT 插件状态需要分别核验。" : ""
+    proxyFormTouched = false
+    await refreshSettings()
+    showNotice(byId("proxy-message"), `代理设置已保存。${connection}。${rateLimit}`, result.runtime?.healthy === false && result.reconnect !== "not_started" ? "bad" : "ok")
+  } catch (error) {
+    proxyFormTouched = false
+    await refreshSettings()
+    showNotice(byId("proxy-message"), `${error.message}${error.code ? `（${error.code}）` : ""}`, "bad")
+  } finally { button.disabled = false }
+}
+
+byId("proxy-apply").addEventListener("click", () => { void applyProxy() })
+byId("proxy-disable").addEventListener("click", () => { void applyProxy("direct") })
+
+async function copyDiagnostics() {
   if (!diagnosticsData) return showNotice(byId("settings-message"), "请先刷新连接诊断。", "bad")
   const data = diagnosticsData
   const safeCopy = {
@@ -584,13 +733,24 @@ byId("copy-diagnostics").addEventListener("click", async () => {
       message: data.tunnel.message,
       lastError: data.tunnel.lastError,
     },
+    proxy: data.proxy ? {
+      state: data.proxy.state, mode: data.proxy.mode, source: data.proxy.source, address: data.proxy.address,
+      usingProxy: data.proxy.usingProxy, running: data.proxy.running, healthy: data.proxy.healthy, ready: data.proxy.ready,
+      activeMode: data.proxy.activeMode, activeAddress: data.proxy.activeAddress, activeSince: data.proxy.activeSince,
+      pollHealthState: data.proxy.pollHealthState, lastSuccessfulPollAt: data.proxy.lastSuccessfulPollAt,
+      lastMetadataAt: data.proxy.lastMetadataAt, lastPortTest: data.proxy.lastPortTest, lastOpenAiTest: data.proxy.lastOpenAiTest,
+      lastMetadataAttemptAt: data.proxy.lastMetadataAttemptAt, lastMetadataError: data.proxy.lastMetadataError,
+      autoStart: data.proxy.autoStart,
+    } : null,
     chatgpt: data.chatgpt,
   }
   try {
     await navigator.clipboard.writeText(JSON.stringify(safeCopy, null, 2))
-    showNotice(byId("settings-message"), "脱敏诊断已复制；未包含 Runtime API Key、Tunnel ID、工作区路径或文件内容。", "ok")
-  } catch { showNotice(byId("settings-message"), "剪贴板不可用，请从本机诊断详情手动复制。", "bad") }
-})
+    showNotice(byId("proxy-message"), "脱敏诊断已复制；不含代理凭据、Runtime API Key、Tunnel ID、工作区路径或文件内容。", "ok")
+  } catch { showNotice(byId("proxy-message"), "剪贴板不可用，请从本机诊断详情手动复制。", "bad") }
+}
+byId("copy-diagnostics").addEventListener("click", () => { void copyDiagnostics() })
+byId("proxy-copy-diagnostics").addEventListener("click", () => { void copyDiagnostics() })
 
 void initialize()
 setInterval(() => { if (sessionReady) void refreshCore() }, 15000)

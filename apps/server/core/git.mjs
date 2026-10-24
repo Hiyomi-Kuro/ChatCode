@@ -53,6 +53,20 @@ export async function gitStatus({ workspace_id }) {
   return { workspace_id, status: output.slice(0, 32_000), truncated: output.length > 32_000 }
 }
 
+export async function gitLog({ workspace_id }) {
+  const workspace = await requireWorkspace(workspace_id)
+  const output = await runGit(workspace, ["log", "-8", "--date=iso-strict", "--format=%h%x09%ad%x09%s"], 128 * 1024)
+  const commits = output.split(/\r?\n/).filter(Boolean).slice(0, 8).map((line) => {
+    const [hash, date, ...subject] = line.split("\t")
+    return {
+      hash: String(hash ?? "").slice(0, 16),
+      date: String(date ?? "").slice(0, 40),
+      subject: String(subject.join(" ") ?? "").replace(/[\0\x1b\x7f]/g, "").slice(0, 240),
+    }
+  })
+  return { workspace_id, commits }
+}
+
 export async function gitDiff({ workspace_id, path }) {
   const workspace = await requireWorkspace(workspace_id)
   const baseArgs = ["diff", "--no-ext-diff", "--no-color", "--no-textconv"]

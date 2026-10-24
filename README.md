@@ -4,7 +4,7 @@ ChatCode 是一个 Windows 本地 MCP 服务，让 ChatGPT 网页版在用户授
 
 ## 当前状态
 
-本仓库提供本机管理页、MCP stdio 工具、Windows 文件句柄安全辅助程序和分块文件传输。工作区可设为只读、可写并逐项审批，或由本机用户单独确认后可写且无需 ChatCode 本机逐项审批。任意文件格式通过原始字节分块读写；`data/changes.json` 保存小型审批元数据，大文件正文位于 `.tmp/uploads`。白名单项目脚本仍要求独立本机审批。ChatGPT 账号、工作区权限、OpenAI Tunnel ID 和 Runtime API Key 必须由用户在各自官方页面配置；ChatCode 不会读取或复用 WinCodex 的凭据。
+本仓库提供本机管理页、MCP stdio 工具、Windows 文件句柄安全辅助程序、分块文件传输和 Host-driven Agent task checkpoint。工作区可设为只读、可写并逐项审批，或由本机用户单独确认后可写且无需 ChatCode 本机逐项审批。任意文件格式通过原始字节分块读写；`data/changes.json` 保存小型审批元数据，大文件正文位于 `.tmp/uploads`。固定 npm 脚本和 ChatCode 内置测试/语法命令均要求独立本机审批；当前不开放任意 Shell/argv。ChatGPT 账号、工作区权限、OpenAI Tunnel ID 和 Runtime API Key 必须由用户在各自官方页面配置；ChatCode 不会读取或复用 WinCodex 的凭据。
 
 ChatGPT 自定义 MCP 应用当前支持读和写工具，但能否在某个账号或工作区创建、安装和运行仍受账户、工作区角色及管理员限制。本机无法从本次 Codex 会话读取 ChatGPT 设置，因此当前账号的实际权限尚未验证。连接步骤和准确限制见 [`docs/chatgpt-mcp.md`](docs/chatgpt-mcp.md)。
 
@@ -16,7 +16,7 @@ ChatGPT 自定义 MCP 应用当前支持读和写工具，但能否在某个账�
 - PowerShell 5.1 或更高版本
 - 可选：OpenAI 官方 `tunnel-client` Windows 二进制、用户单独创建的 Tunnel ID 和 Runtime API Key
 
-Bun 当前未安装；ChatCode 使用 Node.js。OpenCode SDK 使用独立的可选 npm 包目录，不会在 OpenCode 仓库里安装依赖或产生文件。当前适配器只验证 SDK 主机和会话生命周期；它还没有把 OpenCode Agent 接入 ChatCode MCP 或本机审批流程。
+Bun 当前未安装；ChatCode 使用 Node.js。OpenCode SDK 使用独立的可选 npm 包目录，不会在 OpenCode 仓库里安装依赖或产生文件。适配器只验证 SDK 主机和会话生命周期；没有调用 `sessions.prompt()`，ChatCode 也没有连接 OpenCode 的 Agent loop。
 
 ## 安装和启动
 
@@ -70,6 +70,8 @@ npm run verify:opencode
 
 ```powershell
 npm test
+npm run test:harness
+npm run test:agent-e2e
 npm run test:browser
 npm run clean:tmp
 ```
@@ -83,5 +85,12 @@ npm run clean:tmp
 - [`docs/architecture.md`](docs/architecture.md)：模块边界、默认 ChatGPT 原生 MCP 路径与 OpenCode Agent 集成状态。
 - [`docs/security.md`](docs/security.md)：目录边界、敏感文件、修改审批、命令审批与审计记录。
 - [`docs/validation.md`](docs/validation.md)：逐项记录已执行的本地测试和未验证的外部依赖。
+- [`docs/harness-feasibility.md`](docs/harness-feasibility.md)：本机、Host、平台与额外模型能力归属及实测边界。
+- [`docs/harness-agent-protocol.md`](docs/harness-agent-protocol.md)：host-driven task 状态、工具顺序和续接流程。
+- [`docs/agent-capabilities.md`](docs/agent-capabilities.md)：当前工具能力和未实现范围。
 
-ChatGPT 网页模型负责自然语言推理；MCP 工具只执行它提出且通过本机授权的具体操作。这条默认路径不调用额外模型 API。OpenCode Agent 目前不是可用执行模式：可选 SDK 检查能创建并读取本地会话，但没有执行 `sessions.prompt()`；真正运行 Agent 需要 OpenCode 模型供应方和进一步的本机权限审批集成。
+ChatGPT 网页模型负责自然语言推理；MCP 工具只执行它提出且通过本机授权的具体操作。这条默认路径不调用额外模型 API。ChatCode 可以保存 task checkpoint 并恢复本地 job 证据；它不会在 ChatGPT Host 停止调用后自主推理。此前连接器探测曾遇到 HTTP 429 和 Session terminated；本轮现有 ChatCode 连接器的只读 `list_workspaces`、`get_harness_status` 与安全小文件读取均成功。未验证 ChatGPT Web 多轮模型决策和失败后自主修复闭环。详见可行性矩阵和验证记录。
+
+## 本机 Tunnel 代理
+
+在“连接设置 → 网络代理”中选择直连、系统环境代理或自定义 HTTP 代理。自定义地址预填 `http://127.0.0.1:9910`，只有点击“应用并安全重连”后才会保存并传入 ChatCode 专属 `tunnel-client` 子进程；不会修改 Windows 用户或系统级代理。可以分别测试本机代理端口与 OpenAI API。强制代理不可用时 Tunnel 会报错，不会退回直连。勾选“ChatCode 启动时自动连接 Tunnel”后，启动脚本会按保存的模式恢复连接。回滚时将模式改回直连或系统环境代理，再应用并安全重连；失败的应用会恢复之前保存的设置。

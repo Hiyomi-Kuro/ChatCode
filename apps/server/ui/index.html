@@ -24,7 +24,7 @@
   <nav class="main-nav" aria-label="管理页面">
     <button class="nav-button active" type="button" data-page="workspaces" aria-current="page">工作区</button>
     <button class="nav-button" type="button" data-page="changes">变更审批</button>
-    <button class="nav-button" type="button" data-page="tasks">项目检查</button>
+    <button class="nav-button" type="button" data-page="tasks">命令与任务</button>
     <button class="nav-button" type="button" data-page="settings">连接设置</button>
     <button class="nav-button" type="button" data-page="logs">运行日志</button>
   </nav>
@@ -58,8 +58,12 @@
 
     <section id="page-tasks" class="page" hidden>
       <section class="panel">
-        <div class="section-title"><div><p class="eyebrow">03 / PROJECT CHECKS</p><h2>项目检查任务</h2></div><p>仅运行固定脚本名；批准前显示 package.json 中的实际命令。</p></div>
+        <div class="section-title"><div><p class="eyebrow">03 / APPROVED COMMANDS</p><h2>本地命令任务</h2></div><p>仅运行固定 npm 脚本或 ChatCode 命令模板；批准前显示命令参数和执行路径。</p></div>
         <div id="tasks" class="cards"></div>
+      </section>
+      <section class="panel">
+        <div class="section-title"><div><p class="eyebrow">04 / HOST-DRIVEN AGENT</p><h2>ChatGPT 驱动任务</h2></div><p>显示持久化计划和最近观察；下一步推理由 ChatGPT Host 执行，本地不会在模型结束后自行推理。</p></div>
+        <div id="agent-tasks" class="cards"></div>
       </section>
     </section>
 
@@ -96,6 +100,33 @@
             <button id="save-settings" type="submit">保存配置</button>
           </div>
         </form>
+        <div class="proxy-config" aria-labelledby="proxy-heading">
+          <div class="proxy-heading-row"><h3 id="proxy-heading">网络代理</h3><span id="proxy-status-badge" class="badge">状态未知</span></div>
+          <p class="hint">代理配置只作用于 ChatCode 专属 tunnel-client 子进程。自定义代理通过官方 <code>TUNNEL_CLIENT_HTTP_PROXY</code> 环境变量传入；本机管理 API 与 stdio MCP 保持本地通信。代理不可用时不会自动改走直连。</p>
+          <div class="proxy-fields">
+            <label>代理模式
+              <select id="proxy-mode" name="proxyMode">
+                <option value="direct">直连</option>
+                <option value="system">系统环境代理</option>
+                <option value="custom">自定义 HTTP 代理</option>
+              </select>
+            </label>
+            <label id="proxy-url-label">自定义 HTTP 代理地址
+              <input id="proxy-url" name="proxyUrl" type="url" maxlength="2048" value="http://127.0.0.1:9910" placeholder="http://127.0.0.1:9910" autocomplete="off" spellcheck="false">
+            </label>
+          </div>
+          <label class="proxy-autostart"><input id="proxy-auto-start" type="checkbox" checked> ChatCode 启动时自动连接 Tunnel</label>
+          <p id="proxy-status-detail" class="proxy-status-detail" aria-live="polite">正在读取 Tunnel 实际代理状态…</p>
+          <div id="proxy-metrics" class="proxy-metrics" aria-live="polite"></div>
+          <div class="actions proxy-actions">
+            <button id="proxy-test-port" class="secondary" type="button">测试代理端口</button>
+            <button id="proxy-test-openai" class="secondary" type="button">测试访问 OpenAI</button>
+            <button id="proxy-apply" type="button">应用并安全重连</button>
+            <button id="proxy-disable" class="secondary" type="button">禁用代理</button>
+            <button id="proxy-copy-diagnostics" class="secondary" type="button">复制脱敏诊断</button>
+          </div>
+          <div id="proxy-message" class="notice" role="status" aria-live="polite" hidden></div>
+        </div>
         <div id="client-message" class="notice" role="status" aria-live="polite" hidden></div>
       </section>
 

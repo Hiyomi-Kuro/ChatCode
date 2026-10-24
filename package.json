@@ -10,6 +10,8 @@
     "start": "node apps/server/admin.mjs",
     "mcp": "node apps/server/mcp.mjs",
     "test": "node --test",
+    "test:harness": "node --test tests/mcp.integration.test.mjs",
+    "test:agent-e2e": "node --test tests/agent-e2e.test.mjs",
     "test:browser": "node tests/admin.browser.e2e.mjs",
     "install:opencode": "npm install --prefix packages/opencode-adapter --cache .tmp/cache/npm --no-audit --no-fund --ignore-scripts",
     "verify:opencode": "node packages/opencode-adapter/verify.mjs",

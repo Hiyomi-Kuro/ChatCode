@@ -91,6 +91,14 @@ export async function updateWorkspace(id, patch) {
   if (patch.mode === "autoWritable" && patch.confirmAutoWrite !== true) throw new Error("免逐项审批需要本机单独明确确认")
   if (patch.allowSensitive === true && patch.confirmSensitive !== true) throw new Error("敏感文件访问需要单独明确确认")
   const prior = await getWorkspace(id)
+  const revokesExecution = patch.status === "paused" || (patch.mode === "readOnly" && prior.mode !== "readOnly")
+  const stopWorkspaceProcesses = async () => {
+    const { cancelWorkspaceTasks } = await import("./tasks.mjs")
+    const results = await cancelWorkspaceTasks(id)
+    const failures = results.filter((result) => result.error)
+    if (failures.length) throw new Error(`撤销工作区执行权限失败；仍需检查任务：${failures.map((item) => item.task_id).join(", ")}`)
+  }
+  if (revokesExecution) await stopWorkspaceProcesses()
   const saved = await mutateArray("workspaces", async (workspaces) => {
     const index = workspaces.findIndex((item) => item.id === id)
     if (index < 0) throw new Error("找不到已授权工作区")
@@ -114,6 +122,7 @@ export async function updateWorkspace(id, patch) {
     workspaces[index] = current
     return displayWorkspace(current)
   })
+  if (revokesExecution) await stopWorkspaceProcesses()
   if (patch.mode !== undefined && patch.mode !== prior.mode) await audit("workspace_mode_changed", { workspaceId: id, result: `${prior.mode}_to_${patch.mode}` })
   if (patch.allowSensitive !== undefined && (prior.allowSensitive === true) !== (patch.allowSensitive === true)) {
     await audit("workspace_sensitive_access_changed", { workspaceId: id, result: patch.allowSensitive ? "granted" : "revoked" })
@@ -124,10 +133,17 @@ export async function updateWorkspace(id, patch) {
 
 export async function removeWorkspace(id) {
   await getWorkspace(id)
+  const { cancelWorkspaceTasks } = await import("./tasks.mjs")
+  const stopped = await cancelWorkspaceTasks(id)
+  const failures = stopped.filter((result) => result.error)
+  if (failures.length) throw new Error(`移除工作区前无法确认任务已停止：${failures.map((item) => item.task_id).join(", ")}`)
   await mutateArray("workspaces", async (workspaces) => {
     const next = workspaces.filter((item) => item.id !== id)
     if (next.length === workspaces.length) throw new Error("找不到已授权工作区")
     workspaces.splice(0, workspaces.length, ...next)
   })
+  const remaining = await cancelWorkspaceTasks(id)
+  const unresolved = remaining.filter((result) => result.error)
+  if (unresolved.length) throw new Error(`工作区已撤销，但仍有任务需要检查：${unresolved.map((item) => item.task_id).join(", ")}`)
   await audit("workspace_removed", { workspaceId: id, result: "revoked" })
 }

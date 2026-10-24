@@ -12,12 +12,13 @@ import { assertRegularFile, ensureLayout } from "./core/state.mjs"
 import { addWorkspace, getWorkspace, listWorkspaces, removeWorkspace, updateWorkspace } from "./core/workspaces.mjs"
 import { approveChange, listChanges, recoverChange, recoverInterruptedChanges } from "./core/changes.mjs"
 import { approveTask, cancelTask, listTasks, markInterruptedTasks } from "./core/tasks.mjs"
+import { listAgentTasks } from "./core/agent-tasks.mjs"
 import { fileInfo, getSafeFsMetrics } from "./core/safe-fs.mjs"
 import { abortWrite, listUploads } from "./core/uploads.mjs"
 import {
-  checkTunnelMetadata, deleteRuntimeCredential, detectTunnelClient, diagnoseTunnel, getTunnelRuntimeStatus,
+  applyTunnelProxySettings, checkTunnelMetadata, deleteRuntimeCredential, detectTunnelClient, diagnoseTunnel, getTunnelProxyStatus, getTunnelRuntimeStatus,
   loadTunnelSettings, loadTunnelSnapshot, recordTunnelEvent, restoreTunnelSnapshot, runtimeCredentialStatus,
-  saveRuntimeCredential, saveTunnelSettings, startTunnel, stopTunnel, tunnelProfilePath,
+  saveRuntimeCredential, saveTunnelSettings, startTunnel, stopTunnel, testTunnelOpenAI, testTunnelProxyPort, tunnelProfilePath,
 } from "./core/tunnel.mjs"
 
 const execFile = promisify(execFileCallback)
@@ -36,9 +37,6 @@ let shutdownOperation = null
 let shuttingDown = false
 
 await ensureLayout()
-await restoreTunnelSnapshot()
-await recoverInterruptedChanges()
-await markInterruptedTasks()
 await assertRegularFile(runtimeFile, { allowMissing: true })
 try {
   const previous = JSON.parse(await readFile(runtimeFile, "utf8"))
@@ -47,6 +45,9 @@ try {
 } catch (error) {
   if (error?.code !== "ENOENT") throw error
 }
+await restoreTunnelSnapshot()
+await recoverInterruptedChanges()
+await markInterruptedTasks()
 
 function sendJson(response, status, value) {
   response.writeHead(status, {
@@ -147,6 +148,7 @@ async function route(request, response) {
   if (request.method === "GET" && url.pathname === "/api/uploads") return sendJson(response, 200, await listUploads())
   if (request.method === "GET" && url.pathname === "/api/changes") return sendJson(response, 200, { changes: await listChanges() })
   if (request.method === "GET" && url.pathname === "/api/tasks") return sendJson(response, 200, { tasks: await listTasks() })
+  if (request.method === "GET" && url.pathname === "/api/agent-tasks") return sendJson(response, 200, { tasks: await listAgentTasks() })
   if (request.method === "GET" && url.pathname === "/api/audit") {
     let lines = []
     try { lines = (await readFile(DATA_FILES.audit, "utf8")).split(/\r?\n/).filter(Boolean).slice(-150) } catch { /* no audit events yet */ }
@@ -160,6 +162,7 @@ async function route(request, response) {
       mcp: mcpLastCheck,
       safeFs: getSafeFsMetrics(),
       tunnel: { ...tunnel, credentialConfigured: await runtimeCredentialStatus(), clientConfigured: Boolean(settings.clientPath), tunnelIdConfigured: Boolean(settings.tunnelId), profile: settings.profile, profilePath: tunnelProfilePath(settings) },
+      proxy: await getTunnelProxyStatus(tunnel),
       chatgpt: { status: "needs_web_confirmation", message: "需在 ChatGPT 网页确认应用注册、工具发现和真实工具调用。" },
       tunnelEvents: loadTunnelSnapshot().events,
     })
@@ -194,6 +197,9 @@ async function route(request, response) {
     return sendJson(response, 200, await detectTunnelClient(body.clientPath ?? settings.clientPath))
   }
   if (url.pathname === "/api/tunnel/settings") return sendJson(response, 200, await saveTunnelSettings(body))
+  if (url.pathname === "/api/tunnel/proxy/test-port") return sendJson(response, 200, await testTunnelProxyPort(body))
+  if (url.pathname === "/api/tunnel/proxy/test-openai") return sendJson(response, 200, await testTunnelOpenAI(body))
+  if (url.pathname === "/api/tunnel/proxy/apply") return sendJson(response, 200, await applyTunnelProxySettings(body))
   if (url.pathname === "/api/tunnel/credential") return sendJson(response, 200, await saveRuntimeCredential(body.key))
   if (url.pathname === "/api/tunnel/credential/delete") return sendJson(response, 200, await deleteRuntimeCredential())
   if (url.pathname === "/api/tunnel/metadata") return sendJson(response, 200, await checkTunnelMetadata())
@@ -247,20 +253,44 @@ const server = createServer((request, response) => {
   void route(request, response).catch((error) => {
     const message = String(error instanceof Error ? error.message : "请求失败").replace(/[\r\n\0]/g, " ").slice(0, 400)
     if (response.headersSent) { response.destroy(); return }
-    sendJson(response, Number.isInteger(error?.status) ? error.status : 400, { error: message })
+    sendJson(response, Number.isInteger(error?.status) ? error.status : 400, { error: message, code: typeof error?.code === "string" ? error.code : "request_failed" })
   })
 })
 
 server.listen(PORT, "127.0.0.1", async () => {
   await writeFile(runtimeFile, `${JSON.stringify({ pid: process.pid, port: PORT, origin: ORIGIN, controlToken: csrfToken, startedAt: new Date().toISOString() })}\n`, { encoding: "utf8", flag: "wx" })
   process.stdout.write(`ChatCode 管理界面：${ORIGIN}\n`)
+  setTimeout(() => { void resumeAutoStartTunnel() }, 100).unref?.()
 })
+
+async function resumeAutoStartTunnel() {
+  try {
+    const settings = await loadTunnelSettings()
+    if (!settings.autoStart || !settings.tunnelId || !settings.clientPath || !await runtimeCredentialStatus()) return
+    const status = await startTunnel()
+    recordTunnelEvent("auto_start_succeeded", status.ready ? "ChatCode 启动后 Tunnel 已通过保存的代理配置就绪" : "ChatCode 启动后 Tunnel 已启动，正在等待就绪")
+  } catch (error) {
+    const code = typeof error?.code === "string" ? error.code : "auto_start_failed"
+    recordTunnelEvent(code, `ChatCode 启动时自动连接未完成：${String(error?.message ?? "Tunnel 启动失败")}`)
+  }
+}
 
 async function shutdown() {
   if (shutdownOperation) return shutdownOperation
   shutdownOperation = (async () => {
     if (shuttingDown) return
     shuttingDown = true
+    try {
+      const activeTasks = (await listTasks()).filter((task) => task.status === "starting" || task.status === "running")
+      for (const task of activeTasks) {
+        try { await cancelTask(task.id) }
+        catch (error) {
+          recordTunnelEvent("shutdown_task_cancel_error", `任务 ${task.id} 未确认停止：${String(error?.message ?? "取消失败").replace(/[\r\n]/g, " ").slice(0, 300)}`)
+        }
+      }
+    } catch (error) {
+      recordTunnelEvent("shutdown_task_scan_error", String(error?.message ?? "无法检查本地任务").replace(/[\r\n]/g, " ").slice(0, 300))
+    }
     try {
       await stopTunnel()
     } catch (error) {

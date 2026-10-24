@@ -32,18 +32,26 @@ ChatCode 为 `tunnel-client` 设置独立的 `TUNNEL_CLIENT_STATE_DIR`，启动�
 
 ## 在 ChatGPT 中添加应用
 
-1. 确认 Platform Tunnel 已与目标 ChatGPT workspace 关联，且当前用户具有 `Tunnels Read + Use`。
-2. 在 ChatGPT 的应用设置中打开 **Apps / Connectors**，按当前账号显示的入口启用开发者模式或创建自定义 MCP 应用。选择 **Tunnel** 连接，选取 ChatCode 专属 Tunnel，将应用命名为 `ChatCode` 并安装到目标 workspace。不同计划和 workspace 策略可能隐藏该入口或限制写工具。
-3. 打开对话并选择或提及 `@ChatCode`，先调用 `list_workspaces`，再对测试工作区调用只读 `list_directory`、`read_file` 或 `search_text`。确认返回的路径和内容来自预期测试项目。
-4. 逐项审批工作区中，ChatGPT 调用 `stage_file_write`、`stage_unified_patch` 或原始字节上传工具；本机用户检查并批准后再调用 `apply_change`。在免逐项审批工作区中，普通文件工具直接执行并返回真实状态和 SHA-256，不会打开逐项审批页面。两种模式都受 ChatGPT 网页写工具确认和工作区策略控制。
+1. 确认 OpenAI Platform Tunnel 已和目标 ChatGPT workspace 关联。Tunnel ID 和 Runtime API Key 仍由用户在官方服务配置；Tunnel 只转发 MCP 流量，不是模型 API Key。
+2. 在 ChatGPT Web 当前 **Plugins** 体验中选择加号，再选 **Add custom MCP server**，输入名称并在 **Connection** 选择 **Tunnel**，然后选择可用的 ChatCode Tunnel 或输入其 ID。检查风险提示、继续并创建为 plugin；创建后查看已发现的工具和 metadata。当前官方帮助说明此流程不要求先开启 Developer Mode，但 workspace 策略、账号方案和角色要求仍适用。
+3. 官方帮助列出 ChatGPT Business、Enterprise 和 Edu 的 Web 自定义 MCP 支持。Business 只有管理员/所有者可创建和发布；Enterprise/Edu 的创建权限还可通过 RBAC 管理。实际可用入口以目标 workspace 当前设置为准。
+4. 在新对话里选择 ChatCode app，或使用 `@ChatCode`，先调用 `list_workspaces`，再用 `open_project` 和只读文件/Git 工具确认目标。工具名以成功扫描后展示的最新 schema 为准。
+5. 若本地工具 schema 已更新但 ChatGPT 仍显示旧工具，先恢复连接，再由可管理该 app 的 Business 或 Enterprise/Edu workspace 管理员从 workspace app settings 刷新现有工具列表，无需重建 app。Enterprise/Edu 刷新后，新 actions 默认未启用；管理员应检查 schema diff 并明确启用允许的 actions。刷新要求连接有效。不要为刷新 schema 重建 Tunnel 或复用其他应用凭据。
+6. 逐项审批工作区的修改先在本机管理页审批；`autoWritable` 仅适用于本机明确授予的普通文件操作。两种模式都受 ChatGPT 平台工具确认和 workspace 策略控制。
 
-如果 Apps、自定义 MCP 或开发者模式入口不可用，请 workspace 管理员检查账号计划、开发者设置、应用策略和写工具限制。不要绕过 ChatGPT 确认，也不要把 Tunnel 正常状态写成网页端调用成功。
+如果 Plugins、自定义 MCP 或 Tunnel 入口不可用，请 workspace 管理员检查计划、成员角色、`Create plugins with MCPs`、RBAC 和 workspace app policy。不要绕过平台确认，也不要把 Tunnel 正常状态写成网页端调用成功。
 
 ## 本机诊断与当前验证范围
 
 “连接设置”页分别显示本机 HTTP、MCP stdio、Tunnel 和 ChatGPT 网页端四层状态；提供本机 MCP 实际调用、客户端版本检测、Tunnel metadata、doctor、启动/停止和脱敏诊断复制。没有真实 Runtime API Key 时，metadata、doctor 和 Tunnel 启动会明确提示缺少凭据；本机工作区和 MCP 测试仍可继续使用。
 
-当前环境尚未配置用户的 Tunnel ID 或真实 Runtime API Key，也没有 ChatGPT 设置页的会话访问权限。因此官方客户端版本检测、Profile 生成、本机 MCP stdio 调用可验证；真实 Tunnel metadata/doctor/运行以及 ChatGPT 应用发现和网页端工具调用仍标记为“未配置/需网页确认”。
+此前连接器探测曾遇到 `MCP SSE probe returned 429 from openai.org`，重试随后出现 `Session terminated`。本轮修复后，现有 ChatCode 0 连接器的 `list_workspaces`、`get_harness_status` 与授权根内 117 字节只读 probe 文件读取成功，工具目录报告 39 个工具和当前 schema。先前 429 没有在本轮调用中复现；未重试新建应用，也未轮换 Tunnel ID 或 Runtime API Key。连接器级工具调用已验证，但 ChatGPT Web 的多轮模型决策与失败后自动修复闭环仍需在网页端验证。官方说明工具列表刷新需要有效连接和应用管理权限。
+
+## ChatCode 本机代理设置
+
+“连接设置 → 网络代理”提供直连、系统环境代理和自定义 HTTP 代理。自定义地址默认显示 `http://127.0.0.1:9910`，在本机页面点击“应用并安全重连”前不会生效。管理器先检查 TCP、HTTP CONNECT、TLS 证书和无密钥的 `HEAD https://api.openai.com/v1/models` 响应，再核对 ChatCode runtime 的实时 PID、可执行文件路径和启动时间，停止并等待旧实例退出后才用新环境重启。自定义模式仅向 ChatCode `tunnel-client` 子进程设置官方 `TUNNEL_CLIENT_HTTP_PROXY`；本机管理 API 和 stdio MCP 不使用远程代理。代理失败时不降级直连，页面显示失败类别并允许重试；应用失败会恢复之前的配置。
+
+可选自动连接保存于 `data/tunnel-settings.json`。启用后，ChatCode 管理服务启动时按保存的代理模式启动 Tunnel；没有凭据、代理不可用或 Tunnel 不健康时会记录脱敏失败状态，可在页面显式重试。诊断区分别显示本机 HTTP、MCP stdio、代理/OpenAI API、Tunnel ready 和需在 ChatGPT 网页确认的状态。OpenAI API 的 401/403 表示网络层已到达 API；API 429 只代表 API 请求被限流，不等于 ChatGPT 插件创建成功。
 
 ## 官方资料
 
