@@ -11,6 +11,7 @@ export const DATA_FILES = Object.freeze({
   workspaces: path.join(DATA_DIR, "workspaces.json"),
   changes: path.join(DATA_DIR, "changes.json"),
   tasks: path.join(DATA_DIR, "tasks.json"),
+  agentTasks: path.join(DATA_DIR, "agent-tasks.json"),
   audit: path.join(DATA_DIR, "audit.jsonl"),
   tunnelSettings: path.join(DATA_DIR, "tunnel-settings.json"),
 })

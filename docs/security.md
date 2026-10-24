@@ -36,6 +36,19 @@
 - 命令执行通过独立进程、授权根目录 `cwd`、超时、输出上限、脱敏环境变量和可取消任务管理进行。模型不可拼接命令字符串。
 - 项目脚本本身是代码，执行前必须先由本机用户确认。执行进程仍使用当前 Windows 用户身份；ChatCode 尚未把任意 npm 脚本限制到 Windows AppContainer 或独立虚拟机。不要批准不可信仓库里的脚本。高隔离运行时是后续安全增强项。
 
+### Android Gradle 构建
+
+- Android 任务只接受 `assembleDebug`、`testDebugUnitTest` 和 `lintDebug`。请求会记录唯一 runner、固定参数、授权 workspace/project、SDK/JDK、Gradle 分发、仓库声明、输入文件哈希及隔离缓存路径；本机管理页必须批准该任务后才可启动。批准后再次比较 workspace 状态、输入指纹与 runner。任何构建输入变化都需要新请求和审批。
+- Gradle Wrapper 只能指向 `services.gradle.org` 官方发行站；可用缓存的分发在启动前检查真实路径和文件类型。插件版本、Android SDK/JDK 兼容性与声明的仓库主机被扫描并加入诊断。下载依赖只写入项目内 `.tmp` 的 Gradle User Home，不复用用户全局 Gradle 初始化脚本或缓存。项目 `.tmp` 中的构建脚本和 Gradle 插件仍是执行代码。
+- 构建在独立 Node worker 中运行，状态、runner PID、分页输出和取消信息持久化；MCP 服务重启后可接管状态，取消会尝试终止 worker 与子进程树。日志长度有限并执行基本敏感值过滤。独立进程、隔离缓存和固定任务不构成 Windows OS sandbox。
+- Gradle 配置、插件和任务以当前 Windows 用户权限运行，可能读取或写入该用户能访问的工作区以外文件、启动子进程并访问网络。仅检查 Gradle 文件中可见仓库 URL 不能限制插件运行时网络或动态依赖来源。仅在信任项目代码和插件时批准构建；对需要真正隔离的仓库应使用 Windows Sandbox、虚拟机或容器等外部边界。
+- 只有 `assembleDebug` 成功后才能调用 APK 发布工具。工具只从固定 debug 输出位置接收 APK，使用 Android `aapt` 检查包名、启动 Activity 和 SDK 字段，以 `apksigner` 验证签名，比较构建输入哈希并将 APK 原子复制到同一项目根的 `app-debug.apk`。这不是发布版签名；不接收任意来源/目标路径，不读取或使用用户 keystore。
+- Android build `.tmp` 是项目级构建缓存和日志目录，不是全局临时区。清理前必须确认没有运行中的构建；最终 `app-debug.apk` 保留在项目根。
+
+### Agent 检查点
+
+Agent 检查点只保存目标、计划状态、有限摘要和任务关联；它不代表模型历史，不执行自主推理，也不授予 workspace、文件、命令或网络权限。跨进程状态更新使用锁目录和原子 JSON 替换；锁的陈旧恢复依据进程状态与时间，Git 诊断失败不能造成半提交检查点。
+
 ## 审计与临时文件
 
 - `data/audit.jsonl` 不记录文件正文、密钥、Cookie、完整命令输出或请求认证头；常见敏感文件名以 `[sensitive path]` 代替。上传进度由每块 MCP 回执和本机“进行中的分块传输”列表显示；完整上传正在校验并原子发布时显示独立提交阶段，不提供误导性的取消按钮。

@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto"
-import { lstat, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises"
+import { lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
-import { rm } from "node:fs/promises"
+import { setTimeout as delay } from "node:timers/promises"
 import { DATA_DIR, DATA_FILES, TMP_DIR } from "./config.mjs"
 
 const queues = new Map()
+const STATE_LOCK_TIMEOUT_MS = 30_000
+const STATE_LOCK_STALE_MS = 60_000
 
 export async function ensureLayout() {
   await ensurePlainDirectory(DATA_DIR)
@@ -75,12 +77,76 @@ export async function writeArray(key, value) {
 
 export function mutateArray(key, mutate) {
   const previous = queues.get(key) ?? Promise.resolve()
-  const operation = previous.catch(() => {}).then(async () => {
+  const operation = previous.catch(() => {}).then(async () => withStateLock(key, async () => {
     const value = await readArray(key)
     const result = await mutate(value)
     await writeArray(key, value)
     return result
-  })
+  }))
   queues.set(key, operation)
   return operation
+}
+
+async function withStateLock(key, action) {
+  const lockPath = path.join(TMP_DIR, `state-lock-${key}`)
+  const ownerPath = path.join(lockPath, "owner.json")
+  const token = randomUUID()
+  const deadline = Date.now() + STATE_LOCK_TIMEOUT_MS
+
+  while (true) {
+    let created = false
+    try {
+      await mkdir(lockPath)
+      created = true
+      await writeFile(ownerPath, JSON.stringify({ token, pid: process.pid, createdAt: Date.now() }), { encoding: "utf8", flag: "wx" })
+      break
+    } catch (error) {
+      if (created) {
+        try { await rm(lockPath, { recursive: true, force: true }) } catch { /* preserve the original lock error */ }
+      }
+      if (error?.code !== "EEXIST") {
+        throw error
+      }
+      await removeStaleStateLock(lockPath, ownerPath)
+      if (Date.now() >= deadline) throw new Error(`等待 ${key} 持久化锁超时`)
+      await delay(35 + Math.floor(Math.random() * 35))
+    }
+  }
+
+  try {
+    return await action()
+  } finally {
+    try {
+      const stat = await lstat(lockPath)
+      if (stat.isDirectory() && !isReparse(stat)) {
+        const owner = JSON.parse(await readFile(ownerPath, "utf8"))
+        if (owner.token === token && owner.pid === process.pid) await rm(lockPath, { recursive: true, force: true })
+      }
+    } catch { /* an interrupted or replaced lock is left for stale-lock recovery */ }
+  }
+}
+
+async function removeStaleStateLock(lockPath, ownerPath) {
+  try {
+    const directory = await lstat(lockPath)
+    if (!directory.isDirectory() || isReparse(directory)) throw new Error("拒绝使用非普通状态锁目录")
+    let owner
+    try {
+      const ownerStat = await lstat(ownerPath)
+      if (!ownerStat.isFile() || isReparse(ownerStat)) throw new Error("拒绝使用非普通状态锁文件")
+      owner = JSON.parse(await readFile(ownerPath, "utf8"))
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error
+    }
+    const ageMs = Date.now() - (Number(owner?.createdAt) || directory.mtimeMs)
+    if (ageMs < STATE_LOCK_STALE_MS) return
+    if (Number.isInteger(owner?.pid) && isPidRunning(owner.pid)) return
+    await rm(lockPath, { recursive: true, force: true })
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error
+  }
+}
+
+function isPidRunning(pid) {
+  try { process.kill(pid, 0); return true } catch (error) { return error?.code === "EPERM" }
 }

@@ -11,6 +11,8 @@
     "mcp": "node apps/server/mcp.mjs",
     "test": "node --test",
     "test:browser": "node tests/admin.browser.e2e.mjs",
+    "test:harness": "node --test tests/mcp.integration.test.mjs tests/agent-command.integration.test.mjs tests/android-harness.unit.test.mjs tests/android-task-recovery.test.mjs tests/android-admin-approval.test.mjs",
+    "test:agent-e2e": "node --test tests/agent-command.integration.test.mjs",
     "install:opencode": "npm install --prefix packages/opencode-adapter --cache .tmp/cache/npm --no-audit --no-fund --ignore-scripts",
     "verify:opencode": "node packages/opencode-adapter/verify.mjs",
     "clean:tmp": "node scripts/clean-tmp.mjs"

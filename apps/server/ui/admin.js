@@ -177,15 +177,21 @@ function renderChanges(items) {
 function renderTasks(items) {
   const root = byId("tasks")
   root.replaceChildren()
-  if (!items.length) return root.append(empty("没有项目脚本任务。"))
+  if (!items.length) return root.append(empty("没有等待审核或最近任务。"))
   for (const item of items.slice(0, 30)) {
     const card = el("article", "card")
     const head = el("div", "card-head")
     head.append(el("div", "card-title", `${item.command} · ${item.id}`), el("span", `badge ${item.status === "succeeded" ? "ok" : ["failed", "timed_out", "cancelled", "interrupted"].includes(item.status) ? "bad" : ""}`, item.status))
     card.append(head, el("div", "meta", `工作区：${item.workspaceDisplay ?? item.workspaceId} · 请求时间：${item.requestedAt}`))
-    card.append(el("pre", "script", item.scriptPreview ?? ""))
-    if (item.status === "awaiting_approval") card.append(button("批准运行此项目脚本", async () => { await post(`/api/tasks/${item.id}/approve`); await refreshCore() }, ""))
-    if (item.status === "approved") card.append(el("div", "meta", "本机已批准。ChatGPT 可以调用 run_approved_check 启动。"))
+    card.append(el("pre", "script", item.commandPreview ? JSON.stringify(item.commandPreview, null, 2) : item.scriptPreview ?? item.command ?? ""))
+    if (item.status === "awaiting_approval") {
+      const label = item.kind === "android_build" ? "批准 Android 构建" : item.kind === "fixed_command" ? "批准运行固定命令" : "批准运行此项目脚本"
+      card.append(button(label, async () => { await post(`/api/tasks/${item.id}/approve`); await refreshCore() }, ""))
+    }
+    if (item.status === "approved") {
+      const runner = item.kind === "android_build" ? "run_approved_android_build" : item.kind === "fixed_command" ? "run_approved_command" : "run_approved_check"
+      card.append(el("div", "meta", `本机已批准。ChatGPT 可调用 ${runner} 启动。`))
+    }
     if (["running", "starting"].includes(item.status)) card.append(button("取消任务", async () => { await post(`/api/tasks/${item.id}`, { action: "cancel" }); await refreshCore() }, "danger"))
     if (item.error) card.append(el("div", "meta", `错误：${item.error}`))
     if (item.output) card.append(el("pre", "output", item.output))
