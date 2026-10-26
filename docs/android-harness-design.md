@@ -2,7 +2,7 @@
 
 ## 目标与边界
 
-Android 构建是由 ChatGPT 宿主驱动的本地工具流程。模型选择项目和固定任务；ChatCode 检查授权、解析工具链、保存精确预览并等待本机用户审批；批准后，独立 worker 执行 Gradle 并将受限日志写入项目 `.tmp`。MCP 不调用另一个模型，也不接受任意 shell、Gradle 参数、runner 路径、环境变量或发布路径。
+Android 构建是由 ChatGPT 宿主驱动的本地工具流程。模型选择项目和固定任务；ChatCode 检查授权、解析工具链并保存精确任务记录。手动 profile 仍需本机批准；匹配 `unattendedDev` scope 时请求持久化为 `queued`、立即返回 task ID，再由 detached worker 异步重新校验后启动 Gradle。受限日志写入项目 `.tmp`。MCP 不调用另一个模型，也不接受任意 shell、Gradle 参数、runner 路径、环境变量或发布路径。
 
 目前允许的 Gradle task 为 `assembleDebug`、`testDebugUnitTest` 和 `lintDebug`。APK 发布只适用于成功的 `assembleDebug`，目标固定为同一 Android 项目根的 `app-debug.apk`。构建需要工作区处于可写和未暂停状态，因为 runner 会在项目内创建 `.tmp` 缓存、临时文件、日志和构建输出；读取环境信息不改写全局设置。
 
@@ -10,8 +10,8 @@ Android 构建是由 ChatGPT 宿主驱动的本地工具流程。模型选择项
 
 1. `get_android_environment(workspace_id, project_path)` 在已授权工作区内定位项目，检查 SDK、platform/build-tools、license、JDK、Gradle Wrapper 或可验证的缓存发行版，并解析 AGP/Kotlin 版本与最低 Gradle 兼容性。工具返回诊断，不下载工具或修改机器级配置。
 2. `request_android_build` 验证任务 allowlist 和完整项目结构，扫描 Gradle 配置、仓库主机、Wrapper URL、现有构建输出及缓存，构造精确 runner 和项目输入指纹。请求本身不启动构建。
-3. 本机管理页展示项目路径、Gradle task、可执行文件、参数、工作目录、JDK/SDK、发行版来源、构建缓存位置、输入哈希和已识别风险。只有本机用户明确批准后才可继续。
-4. `run_approved_android_build` 复核一次性批准、workspace、项目输入指纹、环境选择和 runner 参数。它启动脱离 MCP 生命周期的 `android-worker.mjs`；worker 再次检查已批准任务并调用固定 Gradle launcher。一个 Android 项目同一时间最多运行一个受管 build。
+3. 本机管理页展示项目路径、Gradle task、可执行文件、参数、工作目录、JDK/SDK、发行版来源、构建缓存位置、输入哈希和风险。手动 profile 由本机逐任务批准；`unattendedDev` 只能使用工作区卡片上本机明确配置的项目/task scope。
+4. unattended 请求立即返回 task ID，不等待工具链二次扫描或 Gradle 完成启动。后台 worker 复核授权、workspace、项目输入指纹、环境选择和 runner；随后启动脱离 MCP 生命周期的 `android-worker.mjs`。启动错误会记为终态失败并审计，不让 MCP 请求一直等。一个 Android 项目同一时间最多运行一个受管 build。
 5. `get_task` 与 `get_task_output` 可在构建运行或 MCP 重连后读取状态和分页日志。`cancel_task` 会结束持久 worker 和子进程树；服务启动恢复时保留仍存活 worker，并把已经消失的孤立任务标记为中断。
 6. 成功的 `assembleDebug` 通过 `get_android_build_artifacts` 检查固定输出 APK。工具要求 Gradle 成功且任务匹配；使用 Android `aapt` 检查 package、launcher Activity、minSdk 和 targetSdk，使用 `apksigner verify` 检查 APK 签名，检查输入指纹和 APK 哈希，然后原子发布。再次读取时会校验已发布文件的大小和 SHA-256。
 
@@ -33,7 +33,9 @@ Gradle 诊断对 Groovy/Kotlin DSL、AGP/Gradle/JDK/SDK 兼容、插件仓库、
 
 ## 安全限制
 
-审批和精确 runner 限制了 ChatCode MCP 能请求的 task，但没有给 Gradle 代码提供操作系统沙箱。Gradle settings、插件和项目任务以当前 Windows 用户权限运行，可能启动子进程、访问其可读写的其他文件并访问网络。独立 worker、隔离缓存和仓库 URL 检查都不能替代 Windows Sandbox、虚拟机或容器。只有信任项目、插件和下载源时才批准构建。
+精确 runner 和本机授权限制了 ChatCode MCP 能请求的 task，但没有给 Gradle 代码提供操作系统沙箱。Gradle settings、插件和项目任务以当前 Windows 用户权限运行，可能启动子进程、访问其可读写的其他文件并访问网络。独立 worker、隔离缓存和仓库 URL 检查都不能替代 Windows Sandbox、虚拟机或容器。只有信任项目、插件和下载源时才允许构建；无人值守配置不改变此风险。
+
+2026-10-25 条件检查确认当前 Windows 11 Home 环境没有 `WindowsSandbox.exe`，当前服务进程也不是管理员。没有启用可选 Windows 功能或更改系统设置；OS 隔离仍为 `BLOCKED/NOT_AVAILABLE`，详见 [`phase9-resume-report.md`](phase9-resume-report.md)。
 
 仅发布 debug APK，不执行 release signing、不读 keystore，也不从任意路径复制 APK。`.tmp` 构建树可能较大；删除前应确认没有正在运行的 build，并保留根目录最终 APK。
 

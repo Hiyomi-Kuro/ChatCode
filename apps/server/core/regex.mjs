@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url"
 
 const workerUrl = new URL("./regex-worker.mjs", import.meta.url)
 
-export function boundedRegexMatches(pattern, text, { caseSensitive = false, maxMatches = 10, timeoutMs = 500 } = {}) {
+export function boundedRegexMatches(pattern, text, { caseSensitive = false, maxMatches = 10, timeoutMs = 2_000 } = {}) {
   if (typeof pattern !== "string" || !pattern || pattern.length > 160) throw new Error("正则表达式长度必须为 1 到 160 个字符")
   if (text.length > 1_048_576) throw new Error("正则搜索单文件超过 1 MiB 上限")
   try { new RegExp(pattern, caseSensitive ? "u" : "iu") } catch (error) { throw new Error(`正则表达式无效：${error.message}`) }

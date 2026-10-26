@@ -9,15 +9,22 @@ import { Client } from "@modelcontextprotocol/client"
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio"
 import { CHATCODE_HOME, DATA_DIR, DATA_FILES, TMP_DIR } from "./core/config.mjs"
 import { assertRegularFile, ensureLayout } from "./core/state.mjs"
-import { addWorkspace, getWorkspace, listWorkspaces, removeWorkspace, updateWorkspace } from "./core/workspaces.mjs"
+import {
+  addWorkspace, getWorkspace, listWorkspaces, removeWorkspace, revokeUnattendedDevAuthorization,
+  setUnattendedDevAuthorization, updateWorkspace,
+} from "./core/workspaces.mjs"
+import { listMumuDevicesForAdmin } from "./core/mumu.mjs"
+import { getCustomToolStatus, listCustomTools, reloadCustomTools } from "./core/custom-tools.mjs"
+import { listSkills, refreshSkills } from "./core/skills.mjs"
 import { approveChange, listChanges, recoverChange, recoverInterruptedChanges } from "./core/changes.mjs"
 import { approveTask, cancelTask, listTasks, markInterruptedTasks } from "./core/tasks.mjs"
 import { fileInfo, getSafeFsMetrics } from "./core/safe-fs.mjs"
+import { recoverInterruptedFileOperations } from "./core/file-ops.mjs"
 import { abortWrite, listUploads } from "./core/uploads.mjs"
 import {
   checkTunnelMetadata, deleteRuntimeCredential, detectTunnelClient, diagnoseTunnel, getTunnelRuntimeStatus,
-  loadTunnelSettings, loadTunnelSnapshot, recordTunnelEvent, restoreTunnelSnapshot, runtimeCredentialStatus,
-  saveRuntimeCredential, saveTunnelSettings, startTunnel, stopTunnel, tunnelProfilePath,
+  getProxyProbeStatus, loadTunnelSettings, loadTunnelSnapshot, recordTunnelEvent, restoreTunnelSnapshot, runtimeCredentialStatus,
+  saveRuntimeCredential, saveTunnelSettings, startTunnel, stopTunnel, testProxyApi, testProxyTcp, reconnectTunnel, tunnelProfilePath,
 } from "./core/tunnel.mjs"
 
 const execFile = promisify(execFileCallback)
@@ -30,19 +37,25 @@ const ui = path.join(here, "ui")
 const runtimeFile = path.join(TMP_DIR, "admin-server.json")
 const mcpEntry = path.join(here, "mcp.mjs")
 const folderPicker = path.join(CHATCODE_HOME, "scripts", "select-folder.ps1")
+const runtimeVersion = 7
+const powershellPath = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
 let mcpLastCheck = { status: "not_tested", message: "尚未测试本机 stdio MCP。", checkedAt: null, toolCount: null }
 let mcpCheckOperation = null
 let shutdownOperation = null
 let shuttingDown = false
 
 await ensureLayout()
+await recoverInterruptedFileOperations()
 await restoreTunnelSnapshot()
 await recoverInterruptedChanges()
 await markInterruptedTasks()
 await assertRegularFile(runtimeFile, { allowMissing: true })
 try {
   const previous = JSON.parse(await readFile(runtimeFile, "utf8"))
-  if (isPidRunning(Number(previous.pid))) throw new Error("ChatCode 管理服务已经运行")
+  if (isPidRunning(Number(previous.pid))) {
+    const identity = await getPidIdentity(Number(previous.pid))
+    if (matchesAdminIdentity(identity, previous)) throw new Error("ChatCode 管理服务已经运行")
+  }
   await rm(runtimeFile, { force: true })
 } catch (error) {
   if (error?.code !== "ENOENT") throw error
@@ -58,6 +71,35 @@ function sendJson(response, status, value) {
   response.end(JSON.stringify(value))
 }
 
+async function getPidIdentity(pid) {
+  if (process.platform !== "win32" || !Number.isInteger(pid) || pid <= 0) return null
+  const script = "$p=Get-CimInstance Win32_Process -Filter \"ProcessId=$env:CHATCODE_PID\" -ErrorAction SilentlyContinue; if($p){$created=[Management.ManagementDateTimeConverter]::ToDateTime($p.CreationDate).ToUniversalTime().ToString('o');[pscustomobject]@{name=$p.Name;image=$p.ExecutablePath;command=$p.CommandLine;createdAt=$created}|ConvertTo-Json -Compress}"
+  try {
+    const { stdout } = await execFile(powershellPath, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+      env: { ...process.env, CHATCODE_PID: String(pid) }, windowsHide: true, timeout: 5000, maxBuffer: 16 * 1024, encoding: "utf8",
+    })
+    return stdout.trim() ? JSON.parse(stdout.trim()) : null
+  } catch { return null }
+}
+
+function samePath(a, b) {
+  return process.platform === "win32" ? path.win32.resolve(a).toLowerCase() === path.win32.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b)
+}
+
+function matchesAdminIdentity(identity, runtime) {
+  if (!identity || identity.name !== "node.exe") return false
+  const script = path.join(CHATCODE_HOME, "apps", "server", "admin.mjs")
+  if (!samePath(identity.image ?? "", process.execPath) || !String(identity.command ?? "").toLowerCase().includes(script.toLowerCase())) return false
+  if (runtime.processPath && !samePath(runtime.processPath, process.execPath)) return false
+  if (runtime.projectRoot && !samePath(runtime.projectRoot, CHATCODE_HOME)) return false
+  if (runtime.startedAt) {
+    const startedAt = Date.parse(runtime.startedAt)
+    const createdAt = Date.parse(identity.createdAt)
+    if (!Number.isFinite(startedAt) || !Number.isFinite(createdAt) || Math.abs(createdAt - startedAt) > 60000) return false
+  }
+  return true
+}
+
 function withTimeout(promise, ms, label) {
   let timer
   return Promise.race([
@@ -70,6 +112,15 @@ async function checkLocalMcp() {
   if (mcpCheckOperation) return mcpCheckOperation
   mcpCheckOperation = (async () => {
     const env = { ...process.env, CHATCODE_HOME, CHATCODE_DATA_DIR: DATA_DIR, CHATCODE_TMP_DIR: TMP_DIR }
+    for (const key of [
+      "CHATCODE_RUNTIME_API_KEY", "CONTROL_PLANE_API_KEY", "OPENAI_API_KEY",
+      "TUNNEL_CLIENT_HTTP_PROXY", "CONTROL_PLANE_HTTP_PROXY", "CHATCODE_TUNNEL_HTTP_PROXY",
+      "MCP_HTTP_PROXY", "HARPOON_HTTP_PROXY",
+      "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+      "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+      "tunnel_client_http_proxy", "control_plane_http_proxy", "chatcode_tunnel_http_proxy",
+      "mcp_http_proxy", "harpoon_http_proxy",
+    ]) delete env[key]
     const transport = new StdioClientTransport({ command: process.execPath, args: [mcpEntry], cwd: CHATCODE_HOME, env, stderr: "pipe" })
     const client = new Client({ name: "chatcode-admin-diagnostic", version: "1.0.0" })
     try {
@@ -142,8 +193,11 @@ async function route(request, response) {
     response.writeHead(200, { "Content-Type": url.pathname.endsWith(".js") ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" })
     return response.end(content)
   }
-  if (request.method === "GET" && url.pathname === "/api/session") return sendJson(response, 200, { apiVersion: 2, csrf: csrfToken, origin: ORIGIN, port: PORT })
+  if (request.method === "GET" && url.pathname === "/api/session") return sendJson(response, 200, { apiVersion: 2, runtimeVersion, csrf: csrfToken, origin: ORIGIN, port: PORT, pid: process.pid })
+  if (request.method === "GET" && url.pathname === "/api/mumu/instances") return sendJson(response, 200, await listMumuDevicesForAdmin())
   if (request.method === "GET" && url.pathname === "/api/workspaces") return sendJson(response, 200, { workspaces: await listWorkspaces() })
+  if (request.method === "GET" && url.pathname === "/api/skills") return sendJson(response, 200, await listSkills())
+  if (request.method === "GET" && url.pathname === "/api/custom-tools") return sendJson(response, 200, { catalog: await listCustomTools(), status: await getCustomToolStatus() })
   if (request.method === "GET" && url.pathname === "/api/uploads") return sendJson(response, 200, await listUploads())
   if (request.method === "GET" && url.pathname === "/api/changes") return sendJson(response, 200, { changes: await listChanges() })
   if (request.method === "GET" && url.pathname === "/api/tasks") return sendJson(response, 200, { tasks: await listTasks() })
@@ -159,14 +213,15 @@ async function route(request, response) {
       management: { status: "connected", bind: "127.0.0.1", port: PORT, healthUrl: `${ORIGIN}/healthz`, pid: process.pid },
       mcp: mcpLastCheck,
       safeFs: getSafeFsMetrics(),
-      tunnel: { ...tunnel, credentialConfigured: await runtimeCredentialStatus(), clientConfigured: Boolean(settings.clientPath), tunnelIdConfigured: Boolean(settings.tunnelId), profile: settings.profile, profilePath: tunnelProfilePath(settings) },
+      tunnel: { ...tunnel, credentialConfigured: await runtimeCredentialStatus(), clientConfigured: Boolean(settings.clientPath), tunnelIdConfigured: Boolean(settings.tunnelId), profile: settings.profile, profilePath: tunnelProfilePath(settings), proxyMode: settings.proxyMode, proxyUrl: settings.proxyMode === "http" ? settings.proxyUrl : "" },
       chatgpt: { status: "needs_web_confirmation", message: "需在 ChatGPT 网页确认应用注册、工具发现和真实工具调用。" },
+      proxy: getProxyProbeStatus(),
       tunnelEvents: loadTunnelSnapshot().events,
     })
   }
   if (request.method === "GET" && url.pathname === "/api/tunnel/settings") {
     const settings = await loadTunnelSettings()
-    return sendJson(response, 200, { settings, profilePath: tunnelProfilePath(settings), credentialConfigured: await runtimeCredentialStatus() })
+    return sendJson(response, 200, { settings, profilePath: tunnelProfilePath(settings), credentialConfigured: await runtimeCredentialStatus(), proxy: getProxyProbeStatus() })
   }
   if (request.method === "GET" && url.pathname === "/api/tunnel/status") return sendJson(response, 200, await getTunnelRuntimeStatus())
   if (request.method === "GET" && url.pathname === "/api/logs") {
@@ -185,6 +240,8 @@ async function route(request, response) {
 
   const body = await bodyJson(request)
   if (url.pathname === "/api/workspaces/picker") return sendJson(response, 200, await pickFolder())
+  if (url.pathname === "/api/skills/refresh") return sendJson(response, 200, await refreshSkills())
+  if (url.pathname === "/api/custom-tools/reload") return sendJson(response, 200, await reloadCustomTools())
   if (url.pathname === "/api/mcp/diagnostic") {
     try { return sendJson(response, 200, await checkLocalMcp()) }
     catch { return sendJson(response, 503, { status: "failed", message: mcpLastCheck.message }) }
@@ -196,10 +253,13 @@ async function route(request, response) {
   if (url.pathname === "/api/tunnel/settings") return sendJson(response, 200, await saveTunnelSettings(body))
   if (url.pathname === "/api/tunnel/credential") return sendJson(response, 200, await saveRuntimeCredential(body.key))
   if (url.pathname === "/api/tunnel/credential/delete") return sendJson(response, 200, await deleteRuntimeCredential())
+  if (url.pathname === "/api/tunnel/proxy/tcp") return sendJson(response, 200, await testProxyTcp())
+  if (url.pathname === "/api/tunnel/proxy/api") return sendJson(response, 200, await testProxyApi())
   if (url.pathname === "/api/tunnel/metadata") return sendJson(response, 200, await checkTunnelMetadata())
   if (url.pathname === "/api/tunnel/doctor") return sendJson(response, 200, await diagnoseTunnel())
   if (url.pathname === "/api/tunnel/start") return sendJson(response, 200, await startTunnel())
   if (url.pathname === "/api/tunnel/stop") return sendJson(response, 200, await stopTunnel())
+  if (url.pathname === "/api/tunnel/reconnect") return sendJson(response, 200, await reconnectTunnel())
   if (url.pathname === "/api/shutdown") {
     sendJson(response, 202, { status: "shutting_down" })
     setTimeout(() => { void shutdown() }, 0)
@@ -212,6 +272,30 @@ async function route(request, response) {
       confirmSensitive: body.confirmSensitive,
     })
     return sendJson(response, 201, { workspace })
+  }
+  const unattendedProfile = /^\/api\/workspaces\/([a-f0-9-]+)\/execution-profile\/(enable|revoke)$/.exec(url.pathname)
+  if (unattendedProfile) {
+    const [, id, action] = unattendedProfile
+    if (action === "revoke") return sendJson(response, 200, { workspace: await revokeUnattendedDevAuthorization(id) })
+    let mumuInstance = null
+    if (body.mumuInstance?.index !== undefined && body.mumuInstance?.index !== "") {
+      const discovered = await listMumuDevicesForAdmin()
+      const selected = discovered.instances.find((item) => item.index === String(body.mumuInstance.index))
+      if (!selected) throw new Error("所选 MuMu index 不在当前 mumu-cli info -v all 返回的实例中")
+      mumuInstance = selected
+    }
+    const workspace = await setUnattendedDevAuthorization(id, {
+      confirmUnattendedDev: body.confirmUnattendedDev,
+      npmScripts: body.npmScripts,
+      fixedCommands: body.fixedCommands,
+      androidProjects: body.androidProjects,
+      gitReadOnly: body.gitReadOnly,
+      gitWrite: body.gitWrite,
+      fileLifecycle: body.fileLifecycle,
+      mumuInstance,
+      mumuActions: body.mumuActions,
+    })
+    return sendJson(response, 200, { workspace })
   }
   const uploadAbort = /^\/api\/uploads\/([a-f0-9-]{36})\/abort$/i.exec(url.pathname)
   if (uploadAbort) return sendJson(response, 200, await abortWrite({ upload_id: uploadAbort[1] }))
@@ -252,7 +336,13 @@ const server = createServer((request, response) => {
 })
 
 server.listen(PORT, "127.0.0.1", async () => {
-  await writeFile(runtimeFile, `${JSON.stringify({ pid: process.pid, port: PORT, origin: ORIGIN, controlToken: csrfToken, startedAt: new Date().toISOString() })}\n`, { encoding: "utf8", flag: "wx" })
+  const startedAt = new Date().toISOString()
+  const scriptPath = path.join(here, "admin.mjs")
+  const runtime = {
+    pid: process.pid, port: PORT, origin: ORIGIN, controlToken: csrfToken, apiVersion: 2, runtimeVersion,
+    processPath: process.execPath, projectRoot: CHATCODE_HOME, scriptPath, startedAt,
+  }
+  await writeFile(runtimeFile, `${JSON.stringify(runtime)}\n`, { encoding: "utf8", flag: "wx" })
   process.stdout.write(`ChatCode 管理界面：${ORIGIN}\n`)
 })
 

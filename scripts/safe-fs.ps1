@@ -1,8 +1,9 @@
 ﻿param(
-  [Parameter(Mandatory=$true)][ValidateSet('canonical-root','info','exists','list','list-cursor','read','read-chunk','hash','write','truncate-staging','write-staged','copy-to-staging','create','mkdir')][string]$Operation,
+  [Parameter(Mandatory=$true)][ValidateSet('canonical-root','info','exists','list','list-cursor','read','read-chunk','hash','write','truncate-staging','write-staged','copy-to-staging','create','mkdir','delete','rmdir')][string]$Operation,
   [Parameter(Mandatory=$true)][string]$RootPath,
   [string]$RelativePath = '',
   [string]$ExpectedHash = '',
+  [string]$ExpectedIdentity = '',
   [ValidateRange(1,67108864)][long]$MaxBytes = 1048576,
   [string]$Offset = '0',
   [ValidateRange(1,500)][int]$Limit = 200,
@@ -48,7 +49,7 @@ namespace ChatCode {
   }
   public static class SafeFs {
     const uint OPEN_EXISTING = 3, CREATE_NEW = 1;
-    const uint GENERIC_READ = 0x80000000, GENERIC_WRITE = 0x40000000, READ_ATTRIBUTES = 0x80;
+    const uint GENERIC_READ = 0x80000000, GENERIC_WRITE = 0x40000000, READ_ATTRIBUTES = 0x80, DELETE_ACCESS = 0x00010000;
     const uint SHARE_READ = 1, SHARE_WRITE = 2, SHARE_DELETE = 4;
     const uint BACKUP_SEMANTICS = 0x02000000, OPEN_REPARSE_POINT = 0x00200000;
     const uint ATTR_DIRECTORY = 0x10, ATTR_REPARSE = 0x400;
@@ -219,6 +220,9 @@ namespace ChatCode {
     static string Version(HandleInfo info) {
       return info.VolumeSerial.ToString("x8") + ":" + info.FileIndexHigh.ToString("x8") + info.FileIndexLow.ToString("x8") + ":" +
         info.WriteHigh.ToString("x8") + info.WriteLow.ToString("x8") + ":" + Size(info).ToString(CultureInfo.InvariantCulture);
+    }
+    static string Identity(HandleInfo info) {
+      return info.VolumeSerial.ToString("x8") + ":" + info.FileIndexHigh.ToString("x8") + info.FileIndexLow.ToString("x8");
     }
     public static string CanonicalRoot(string rootPath) {
       string root = Normalize(rootPath);
@@ -513,6 +517,30 @@ namespace ChatCode {
         }
       }
     }
+    public static object DeleteFile(string root, string relative, string expectedHash) {
+      if (!System.Text.RegularExpressions.Regex.IsMatch(expectedHash ?? "", "^[a-fA-F0-9]{64}$")) throw new IOException("文件版本哈希无效。");
+      using (Verified item = OpenVerified(root, relative, GENERIC_READ | DELETE_ACCESS, false, false, SHARE_READ)) {
+        string actualHash;
+        long bytes;
+        using (FileStream stream = new FileStream(Duplicate(item.Target), FileAccess.Read, 65536, false)) {
+          actualHash = HashStream(stream); bytes = stream.Length;
+        }
+        if (!String.Equals(actualHash, expectedHash, StringComparison.OrdinalIgnoreCase)) throw new IOException("文件在删除前已发生变化，保留当前文件。");
+        DeleteByHandle(item.Target);
+        return new { deleted = true, sha256 = actualHash, bytes, version = Version(item.Info) };
+      }
+    }
+    public static object RemoveEmptyDirectory(string root, string relative, string expectedIdentity) {
+      if (!System.Text.RegularExpressions.Regex.IsMatch(expectedIdentity ?? "", "^[a-fA-F0-9]{8}:[a-fA-F0-9]{16}$")) throw new IOException("目录身份校验值无效。");
+      using (Verified item = OpenVerified(root, relative, READ_ATTRIBUTES | DELETE_ACCESS, true, false, SHARE_READ)) {
+        if (!String.Equals(Identity(item.Info), expectedIdentity, StringComparison.OrdinalIgnoreCase)) throw new IOException("目录身份在操作期间发生变化，保留当前目录。");
+        using (IEnumerator<string> children = Directory.EnumerateFileSystemEntries(item.TargetFinal).GetEnumerator()) {
+          if (children.MoveNext()) throw new IOException("目录非空，拒绝删除。");
+        }
+        DeleteByHandle(item.Target);
+        return new { deleted = true, identity = expectedIdentity };
+      }
+    }
   }
 }
 '@
@@ -566,6 +594,12 @@ try {
     [Console]::Out.Write((ConvertTo-Json -InputObject $result -Compress -Depth 5))
   } elseif ($Operation -eq 'mkdir') {
     $result = [ChatCode.SafeFs]::MakeDirectory($RootPath, $RelativePath)
+    [Console]::Out.Write((ConvertTo-Json -InputObject $result -Compress -Depth 5))
+  } elseif ($Operation -eq 'delete') {
+    $result = [ChatCode.SafeFs]::DeleteFile($RootPath, $RelativePath, $ExpectedHash)
+    [Console]::Out.Write((ConvertTo-Json -InputObject $result -Compress -Depth 5))
+  } elseif ($Operation -eq 'rmdir') {
+    $result = [ChatCode.SafeFs]::RemoveEmptyDirectory($RootPath, $RelativePath, $ExpectedIdentity)
     [Console]::Out.Write((ConvertTo-Json -InputObject $result -Compress -Depth 5))
   }
 } catch {

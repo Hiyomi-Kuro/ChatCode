@@ -21,6 +21,7 @@ function runHelper(operation, rootPath, relativePath = "", extra = {}) {
   const args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", SAFE_FS_SCRIPT,
     "-Operation", operation, "-RootPath", rootPath, "-RelativePath", relativePath]
   if (extra.expectedHash) args.push("-ExpectedHash", extra.expectedHash)
+  if (extra.expectedIdentity) args.push("-ExpectedIdentity", extra.expectedIdentity)
   if (extra.maxBytes !== undefined) args.push("-MaxBytes", String(extra.maxBytes))
   if (extra.offset !== undefined) args.push("-Offset", String(extra.offset))
   if (extra.limit !== undefined) args.push("-Limit", String(extra.limit))
@@ -154,4 +155,16 @@ export async function copyFileToStaging(root, relativePath, expectedHash, stagin
 export async function createDirectory(root, relativePath) {
   const relative = normalizeRelative(relativePath)
   return JSON.parse(await runHelper("mkdir", root, relative))
+}
+
+export async function deleteFileIfUnchanged(root, relativePath, expectedHash) {
+  const relative = normalizeRelative(relativePath)
+  if (!/^[a-f0-9]{64}$/i.test(expectedHash ?? "")) throw new Error("缺少有效的文件版本哈希")
+  return JSON.parse(await runHelper("delete", root, relative, { expectedHash }))
+}
+
+export async function removeEmptyDirectory(root, relativePath, expectedIdentity) {
+  const relative = normalizeRelative(relativePath)
+  if (!/^[a-f0-9]{8}:[a-f0-9]{16}$/i.test(expectedIdentity ?? "")) throw new Error("缺少有效的目录身份校验值")
+  return JSON.parse(await runHelper("rmdir", root, relative, { expectedIdentity }))
 }

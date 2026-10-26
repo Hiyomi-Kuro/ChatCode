@@ -36,3 +36,7 @@ Gradle wrapper JAR 从只读 Android 参考项目复制后经 ChatCode `stat_fil
 ## 尚待完成
 
 Android `testDebugUnitTest` 已提交本机审批，任务 ID `ef9c8efd-0095-4e87-9d6e-bcc0bb0bc1b1`，当前等待批准，尚未执行。批准后运行并记录 JUnit 结果，再完成最终报告。未安装到设备，未构建 release APK/AAB。
+
+> 更新（2026-10-25）：以上是第七阶段原始 Calculator 项目的审批状态。本轮第八阶段在随机 package ID 的隔离副本中通过了 `assembleDebug`、`testDebugUnitTest`、`lintDebug` 和 MuMu 验收；原项目、原 APK 与原审批任务均未改动。隔离副本的机器证据、真实模拟器结果及回归测试见 [`validation.md`](validation.md) 与 [`mumu-acceptance.md`](mumu-acceptance.md)。
+
+> 第九阶段复查：没有对 MuMu 做新的 Calculator 交互，因为重新发现的唯一运行实例前台是第三方音乐应用 `com.meizu.media.music`，display 2。`mumu-cli info -v all` 和 `dumpsys activity activities` 是只读查询；本轮没有 hierarchy、输入、截图、安装或 VM 生命周期动作。此阶段不构成 UI hierarchy PASS，证据见 [`phase9-resume-report.md`](phase9-resume-report.md)。

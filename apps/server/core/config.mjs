@@ -12,6 +12,11 @@ export const DATA_FILES = Object.freeze({
   changes: path.join(DATA_DIR, "changes.json"),
   tasks: path.join(DATA_DIR, "tasks.json"),
   agentTasks: path.join(DATA_DIR, "agent-tasks.json"),
+  fileOperations: path.join(DATA_DIR, "file-operations.json"),
+  fileRecovery: path.join(DATA_DIR, "file-recovery.json"),
+  gitCommits: path.join(DATA_DIR, "git-commits.json"),
+  gitPreviews: path.join(DATA_DIR, "git-previews.json"),
+  gitWorktrees: path.join(DATA_DIR, "git-worktrees.json"),
   audit: path.join(DATA_DIR, "audit.jsonl"),
   tunnelSettings: path.join(DATA_DIR, "tunnel-settings.json"),
 })

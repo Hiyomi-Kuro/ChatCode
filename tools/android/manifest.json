@@ -1,0 +1,22 @@
+{
+  "id": "android",
+  "namespace": "android",
+  "version": "1.0.0",
+  "title": "Android project tools",
+  "description": "Controlled Android build inspection and task execution, with Android device actions registered from this package.",
+  "enabledByDefault": true,
+  "entry": "source-controlled",
+  "capabilities": ["android_sdk", "gradle_build", "mumu_device"],
+  "executables": ["java.exe", "gradlew.bat", "mumu-cli.exe", "adb.exe"],
+  "pathScope": "authorized_workspace",
+  "deviceScope": "locally_selected_mumu_instance",
+  "permissionLevel": "workspace_scoped",
+  "timeoutMs": 1800000,
+  "redLines": ["No arbitrary Gradle arguments", "No arbitrary ADB serial", "No emulator deletion or app data wipe"],
+  "tools": [
+    { "name": "environment", "mcpName": "get_android_environment", "inputSchema": { "type": "object", "required": ["workspace_id", "project_path"], "properties": { "workspace_id": { "type": "string", "format": "uuid" }, "project_path": { "type": "string", "maxLength": 2048 } }, "additionalProperties": false }, "permission": "read", "hints": { "readOnly": true, "recoverable": false, "highRisk": false } },
+    { "name": "request_build", "mcpName": "request_android_build", "inputSchema": { "type": "object", "required": ["workspace_id", "project_path"], "properties": { "workspace_id": { "type": "string", "format": "uuid" }, "project_path": { "type": "string", "maxLength": 2048 }, "task": { "enum": ["assembleDebug", "testDebugUnitTest", "lintDebug"] } }, "additionalProperties": false }, "permission": "execution", "hints": { "readOnly": false, "recoverable": true, "highRisk": true } },
+    { "name": "run_build", "mcpName": "run_approved_android_build", "inputSchema": { "type": "object", "required": ["task_id"], "properties": { "task_id": { "type": "string", "format": "uuid" } }, "additionalProperties": false }, "permission": "execution", "hints": { "readOnly": false, "recoverable": true, "highRisk": true } },
+    { "name": "build_artifacts", "mcpName": "get_android_build_artifacts", "inputSchema": { "type": "object", "required": ["task_id"], "properties": { "task_id": { "type": "string", "format": "uuid" } }, "additionalProperties": false }, "permission": "workspace_write", "hints": { "readOnly": false, "recoverable": true, "highRisk": true } }
+  ]
+}

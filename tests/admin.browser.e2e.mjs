@@ -445,7 +445,7 @@ try {
     await click("#start-tunnel")
     await waitPage("document.querySelector('#tunnel-operation-message')?.textContent.includes('请先在连接设置中录入 Runtime API Key')", "缺少凭据时阻止 Tunnel 启动")
     await click("#stop-tunnel")
-    await waitPage("document.querySelector('#tunnel-operation-message')?.textContent.includes('Tunnel 已停止')", "未创建的本机 Tunnel alias 可安全报告为已停止")
+    await waitPage("document.querySelector('#tunnel-operation-message')?.textContent.includes('Tunnel 已断开')", "未创建的本机 Tunnel alias 可安全报告为已断开")
     record("Tunnel 无凭据时 metadata/doctor/启动明确提示；停止未创建 alias 只影响 ChatCode 隔离状态", { metadataMessage: "需要 Runtime API Key", startBlocked: true, isolatedAliasStatus: "disconnected" })
   } else {
     record("Tunnel 客户端缺失态可继续使用本机管理页", "本机没有配置官方客户端绝对路径；没有安装或启动外部连接")

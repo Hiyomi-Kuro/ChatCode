@@ -6,10 +6,10 @@ import path from "node:path"
 import { promisify } from "node:util"
 import { audit } from "./audit.mjs"
 import { TMP_DIR } from "./config.mjs"
-import { assertRegularFile } from "./state.mjs"
-import { fileInfo, readFileBytes } from "./safe-fs.mjs"
+import { assertRegularFile, withNamedStateLock } from "./state.mjs"
+import { fileInfo, hashFile, readFileBytes } from "./safe-fs.mjs"
 import { isPathWithin, normalizeRelative } from "./paths.mjs"
-import { getWorkspace, requireWorkspace } from "./workspaces.mjs"
+import { getUnattendedDevGrant, getWorkspace, requireWorkspace } from "./workspaces.mjs"
 import { mutateArray, readArray } from "./state.mjs"
 
 const ALLOWED_SCRIPTS = new Set(["test", "build", "lint", "typecheck", "check"])
@@ -285,6 +285,9 @@ export async function requestCheck({ workspace_id, script }) {
   try { manifest = JSON.parse(raw.toString("utf8")) } catch { throw new Error("package.json 格式无效") }
   const commandText = manifest?.scripts?.[script]
   if (typeof commandText !== "string" || !commandText.trim() || commandText.length > 4_000) throw new Error(`项目没有可运行的 ${script} 脚本`)
+  const authorization = await getUnattendedDevGrant(workspace, {
+    kind: "npm_script", script, scriptText: commandText, packageJsonSha256: sha256(raw),
+  })
   const task = {
     id: randomUUID(),
     workspaceId: workspace.id,
@@ -292,7 +295,13 @@ export async function requestCheck({ workspace_id, script }) {
     command: `npm run ${script}`,
     scriptPreview: commandText.slice(0, 4_000),
     packageJsonHash: sha256(raw),
-    status: "awaiting_approval",
+    status: authorization ? "queued" : "awaiting_approval",
+    authorizedBy: authorization ? "unattendedDev" : "localApproval",
+    authorizationId: authorization?.authorizationId ?? null,
+    executorSnapshot: authorization ? {
+      nodePath: process.execPath, nodeSha256: sha256(await readFile(process.execPath)),
+      npmCliPath: npmCli, npmCliSha256: sha256(await readFile(npmCli)),
+    } : null,
     requestedAt: new Date().toISOString(),
     startedAt: null,
     finishedAt: null,
@@ -301,33 +310,94 @@ export async function requestCheck({ workspace_id, script }) {
     timeoutMs: MAX_TASK_MS,
   }
   await mutateArray("tasks", (tasks) => { tasks.push(task) })
-  await audit("check_requested", { workspaceId: workspace.id, itemId: task.id, result: "awaiting_approval" })
+  await audit(authorization ? "check_authorized_queued" : "check_requested", { workspaceId: workspace.id, itemId: task.id, result: task.status })
+  if (authorization) {
+    try { await runApprovedTask(task.id) }
+    catch (error) {
+      await finishTask(task.id, { status: "failed", exitCode: null, signal: null, error: String(error?.message ?? "无人值守检查启动失败") })
+      throw error
+    }
+    return { task_id: task.id, status: "running", command: task.command, script_preview: task.scriptPreview, requires_local_approval: false, authorization_id: authorization.authorizationId }
+  }
   return { task_id: task.id, status: task.status, command: task.command, script_preview: task.scriptPreview, requires_local_approval: true }
 }
 
-export async function requestAllowedCommand({ workspace_id, command_type, relative_path, agent_task_id, agent_step_index }) {
+export async function requestAllowedCommand({ workspace_id, command_type, relative_path, agent_task_id, agent_step_index, request_id }) {
   const workspace = await requireWorkspace(workspace_id, { writable: true })
   const command = await fixedCommand(workspace, command_type, relative_path)
+  if (request_id !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(request_id)) throw new Error("request_id 必须是 UUID")
+  if (request_id) {
+    const prior = (await readArray("tasks")).find((item) => item.requestId === request_id)
+    if (prior) {
+      if (prior.workspaceId !== workspace.id || prior.commandType !== command.commandType || prior.relativePath !== command.relativePath ||
+          prior.agentTaskId !== (agent_task_id ?? null) || prior.agentStepIndex !== (agent_step_index ?? null)) throw new Error("request_id 已用于不同的本地命令参数")
+      return { task_id: prior.id, status: prior.status, command_type: prior.commandType, relative_path: prior.relativePath,
+        command: prior.command, preview: prior.commandPreview, requires_local_approval: prior.status === "awaiting_approval", idempotent: true }
+    }
+  }
+  let linkedAgent = null
+  let linkedStep = null
   if (agent_task_id !== undefined || agent_step_index !== undefined) {
     if (typeof agent_task_id !== "string" || !Number.isInteger(agent_step_index) || agent_step_index < 0) throw new Error("agent_task_id 和 agent_step_index 必须一起提供")
+    if (!request_id) throw new Error("关联 Agent DAG 的固定命令必须提供稳定 request_id")
     const linked = await readArray("agentTasks")
-    const agent = linked.find((item) => item.id === agent_task_id)
-    if (!agent || (agent.workspaceId ?? agent.workspace_id) !== workspace.id) throw new Error("找不到同一工作区中的 Agent 任务")
-    if (!agent.plan?.[agent_step_index]) throw new Error("找不到要关联的 Agent 计划步骤")
+    linkedAgent = linked.find((item) => item.id === agent_task_id)
+    if (!linkedAgent || (linkedAgent.workspaceId ?? linkedAgent.workspace_id) !== workspace.id) throw new Error("找不到同一工作区中的 Agent 任务")
+    linkedStep = linkedAgent.plan?.[agent_step_index]
+    if (!linkedStep) throw new Error("找不到要关联的 Agent 计划步骤")
+    if (linkedStep.status !== "in_progress") throw new Error("固定命令只能关联到已通过 DAG 依赖检查并进入 in_progress 的步骤")
+    if ((linkedStep.dependencies ?? []).some((id) => !linkedAgent.plan.some((item) => item.id === id && item.status === "completed"))) throw new Error("Agent DAG 命令步骤仍有未完成依赖")
+    const processLocks = (linkedStep.resource_locks ?? []).filter((resource) => resource.toLowerCase().startsWith("process:"))
+    if (processLocks.length && !processLocks.includes(`process:${command.commandType}`.toLowerCase())) throw new Error(`Agent DAG 未为 ${command.commandType} 声明 process resource lock`)
+    const activeStatuses = new Set(["awaiting_approval", "approved", "queued", "starting", "running"])
+    if ((linkedAgent.localJobs ?? []).some((job) => job.step_index === agent_step_index && activeStatuses.has(job.status))) throw new Error("此 Agent 步骤已有未完成的本地命令；先读取任务状态，避免重复执行")
+    for (const input of linkedStep.input_versions ?? []) {
+      const actual = await hashFile(workspace.root, input.path)
+      if (actual.sha256.toLowerCase() !== String(input.sha256).toLowerCase()) throw new Error(`Agent DAG 命令输入版本冲突：${input.path}`)
+    }
   }
+  const authorization = await getUnattendedDevGrant(workspace, { kind: "fixed_command", commandType: command.commandType })
   const task = {
     id: randomUUID(), kind: "fixed_command", workspaceId: workspace.id,
     commandType: command.commandType, relativePath: command.relativePath,
     command: command.command, commandPreview: command.preview,
     executablePath: command.executable, arguments: command.args,
-    status: "awaiting_approval", requestedAt: new Date().toISOString(),
+    status: authorization ? "queued" : "awaiting_approval", requestedAt: new Date().toISOString(),
+    authorizedBy: authorization ? "unattendedDev" : "localApproval",
+    authorizationId: authorization?.authorizationId ?? null,
+    executableSha256: authorization ? sha256(await readFile(command.executable)) : null,
     startedAt: null, finishedAt: null, exitCode: null, signal: null,
     timeoutMs: MAX_TASK_MS, agentTaskId: agent_task_id ?? null,
     agentStepIndex: agent_step_index ?? null,
+    requestId: request_id ?? null,
   }
-  await mutateArray("tasks", (tasks) => { tasks.push(task) })
-  if (agent_task_id !== undefined) await linkAgentJob(agent_task_id, agent_step_index, task, "awaiting_user", "等待本机批准固定命令。")
-  await audit("command_requested", { workspaceId: workspace.id, itemId: task.id, result: "awaiting_approval" })
+  let inserted = true
+  await withNamedStateLock("command-idempotency", async () => {
+    if (request_id) {
+      const existing = (await readArray("tasks")).find((item) => item.requestId === request_id)
+      if (existing) {
+        if (existing.workspaceId !== workspace.id || existing.commandType !== command.commandType || existing.relativePath !== command.relativePath ||
+            existing.agentTaskId !== (agent_task_id ?? null) || existing.agentStepIndex !== (agent_step_index ?? null)) throw new Error("request_id 已用于不同的本地命令参数")
+        Object.assign(task, existing)
+        inserted = false
+        return
+      }
+    }
+    await mutateArray("tasks", (tasks) => { tasks.push(task) })
+  })
+  if (!inserted) return { task_id: task.id, status: task.status, command_type: task.commandType, relative_path: task.relativePath,
+    command: task.command, preview: task.commandPreview, requires_local_approval: task.status === "awaiting_approval", idempotent: true }
+  if (agent_task_id !== undefined && !authorization) await linkAgentJob(agent_task_id, agent_step_index, task, "awaiting_user", "等待本机批准固定命令。")
+  await audit(authorization ? "command_authorized_queued" : "command_requested", { workspaceId: workspace.id, itemId: task.id, result: task.status })
+  if (authorization) {
+    let started
+    try { started = await runApprovedCommand(task.id) }
+    catch (error) {
+      await finishTask(task.id, { status: "failed", exitCode: null, signal: null, error: String(error?.message ?? "无人值守命令启动失败") })
+      throw error
+    }
+    return { ...started, command_type: command.commandType, relative_path: command.relativePath, requires_local_approval: false, authorization_id: authorization.authorizationId }
+  }
   return {
     task_id: task.id, status: task.status, command_type: command.commandType,
     relative_path: command.relativePath, command: command.command,
@@ -340,7 +410,7 @@ export async function linkAgentJob(agentTaskId, stepIndex, job, taskStatus, summ
     const task = tasks.find((item) => item.id === agentTaskId)
     if (!task || !task.plan?.[stepIndex]) return
     task.localJobs ??= []
-    task.localJobs.push({ task_id: job.id, type: job.kind, status: job.status, created_at: job.requestedAt })
+    task.localJobs.push({ task_id: job.id, type: job.kind, status: job.status, step_index: stepIndex, request_id: job.requestId ?? null, created_at: job.requestedAt })
     task.localJobs = task.localJobs.slice(-50)
     task.status = taskStatus
     task.phase = taskStatus
@@ -350,12 +420,24 @@ export async function linkAgentJob(agentTaskId, stepIndex, job, taskStatus, summ
     const step = task.plan[stepIndex]
     if (taskStatus === "running") step.status = "in_progress"
     else if (job.status === "succeeded") step.status = "completed"
-    else if (["failed", "timed_out", "cancelled"].includes(job.status)) step.status = "failed"
+    else if (["failed", "timed_out", "cancelled"].includes(job.status)) {
+      step.failure_category = job.status === "timed_out" ? "transient" : job.status === "cancelled" ? "cancelled" : "permanent"
+      const attempts = Number(step.attempts) || 0
+      const retries = Number.isInteger(step.max_retries) ? step.max_retries : 2
+      step.status = step.failure_category === "transient" && attempts <= retries ? "retryable" : "failed"
+    }
     step.result_summary = summary
     step.updated_at = task.updatedAt
+    step.timeline = [...(Array.isArray(step.timeline) ? step.timeline : []), {
+      at: task.updatedAt, event: `local_job_${job.status}`, status: step.status,
+      failure_category: step.failure_category ?? null, summary: String(summary).slice(0, 2_000),
+    }].slice(-30)
     const history = Array.isArray(task.history) ? task.history : []
     history.push({ at: task.updatedAt, event: "local_job", summary: `步骤 ${stepIndex + 1}: ${summary}`.slice(0, 2_000) })
     task.history = history.slice(-100)
+    const timeline = Array.isArray(task.timeline) ? task.timeline : []
+    timeline.push({ at: task.updatedAt, event: "local_job", summary: `步骤 ${stepIndex + 1}: ${summary}`.slice(0, 2_000) })
+    task.timeline = timeline.slice(-100)
   })
 }
 
@@ -378,16 +460,37 @@ export async function approveTask(id) {
 export async function runApprovedTask(id) {
   const existing = await taskRecord(id)
   if (!existing) throw new Error("找不到任务")
-  await requireWorkspace(existing.workspaceId, { writable: true })
+  const initialWorkspace = await requireWorkspace(existing.workspaceId, { writable: true })
+  if (existing.authorizedBy === "unattendedDev") {
+    const authorization = await getUnattendedDevGrant(initialWorkspace, {
+      kind: "npm_script", script: existing.script, scriptText: existing.scriptPreview, packageJsonSha256: existing.packageJsonHash,
+    })
+    if (authorization?.authorizationId !== existing.authorizationId) throw new Error("npm 检查的无人值守授权已撤销或变化")
+  }
   const task = await mutateArray("tasks", (tasks) => {
     const item = tasks.find((entry) => entry.id === id)
     if (!item) throw new Error("找不到任务")
-    if (item.status !== "approved") throw new Error("项目检查尚未由本机用户批准")
+    if (item.status !== "approved" && !(item.status === "queued" && item.authorizedBy === "unattendedDev")) throw new Error("项目检查尚未由本机用户批准或无人值守授权")
     item.status = "starting"
     item.startedAt = new Date().toISOString()
     return { ...item }
   })
   const workspace = await requireWorkspace(task.workspaceId, { writable: true })
+  if (task.authorizedBy === "unattendedDev") {
+    try {
+      const authorization = await getUnattendedDevGrant(workspace, {
+        kind: "npm_script", script: task.script, scriptText: task.scriptPreview, packageJsonSha256: task.packageJsonHash,
+      })
+      if (authorization?.authorizationId !== task.authorizationId) throw new Error("npm 检查的无人值守授权已撤销或变化")
+      if (task.executorSnapshot?.nodePath !== process.execPath || sha256(await readFile(process.execPath)) !== task.executorSnapshot?.nodeSha256 ||
+          task.executorSnapshot?.npmCliPath !== npmCli || sha256(await readFile(npmCli)) !== task.executorSnapshot?.npmCliSha256) {
+        throw new Error("Node/npm 执行器指纹已变化；无人值守任务已拒绝")
+      }
+    } catch (error) {
+      await finishTask(id, { status: "failed", exitCode: null, signal: null, error: String(error?.message ?? "无人值守授权失效") })
+      throw error
+    }
+  }
   const currentManifest = await readFileBytes(workspace.root, "package.json", 256 * 1024)
   if (sha256(currentManifest) !== task.packageJsonHash) {
     await finishTask(id, { status: "failed", exitCode: null, signal: null, error: "package.json 在审批后发生变化" })
@@ -447,10 +550,15 @@ export async function runApprovedCommand(id) {
   if (existing.kind !== "fixed_command") throw new Error("此任务不是固定命令任务")
   if (process.platform !== "win32") throw new Error("固定命令仅支持 Windows")
   const workspace = await requireWorkspace(existing.workspaceId, { writable: true })
+  if (existing.authorizedBy === "unattendedDev") {
+    const authorization = await getUnattendedDevGrant(workspace, { kind: "fixed_command", commandType: existing.commandType })
+    if (authorization?.authorizationId !== existing.authorizationId) throw new Error("固定命令的无人值守授权已撤销或变化")
+  }
   const relativePath = normalizeCommandPath(existing.relativePath)
   const execution = await fixedCommand(workspace, existing.commandType, relativePath)
   if (execution.relativePath !== relativePath || execution.executable !== existing.executablePath ||
-      JSON.stringify(execution.args) !== JSON.stringify(existing.arguments) || execution.command !== existing.command) {
+      JSON.stringify(execution.args) !== JSON.stringify(existing.arguments) || execution.command !== existing.command ||
+      (existing.authorizedBy === "unattendedDev" && sha256(await readFile(execution.executable)) !== existing.executableSha256)) {
     throw new Error("固定命令参数在审批后发生变化；请重新请求并审批")
   }
   return launchApprovedProcess(id, "fixed_command", execution)
@@ -462,11 +570,20 @@ export async function launchApprovedProcess(id, expectedKind, execution) {
   if (!existing) throw new Error("找不到任务")
   if (existing.kind !== expectedKind) throw new Error("任务类型与批准的执行器不匹配")
   const workspace = await requireWorkspace(existing.workspaceId, { writable: true })
+  if (existing.authorizedBy === "unattendedDev") {
+    const authorization = existing.kind === "fixed_command"
+      ? await getUnattendedDevGrant(workspace, { kind: "fixed_command", commandType: existing.commandType })
+      : existing.kind === "android_build"
+        ? await getUnattendedDevGrant(workspace, { kind: "android_build", projectPath: existing.projectPath, task: existing.buildTask })
+        : null
+    if (authorization?.authorizationId !== existing.authorizationId) throw new Error("任务的无人值守授权已撤销或变化")
+  }
   const task = await mutateArray("tasks", (tasks) => {
     const item = tasks.find((entry) => entry.id === id)
     if (!item) throw new Error("找不到任务")
     const workerStarting = expectedKind === "android_build" && item.status === "starting"
-    if (item.status !== "approved" && !workerStarting) throw new Error("任务尚未由本机用户批准")
+    const authorizedQueued = item.status === "queued" && item.authorizedBy === "unattendedDev"
+    if (item.status !== "approved" && !workerStarting && !authorizedQueued) throw new Error("任务尚未由本机用户批准或无人值守授权")
     if (!workerStarting) {
       item.status = "starting"
       item.startedAt = new Date().toISOString()
@@ -587,15 +704,25 @@ export async function cancelTask(id) {
 }
 
 export async function markInterruptedTasks() {
-  await mutateArray("tasks", (tasks) => {
+  const interrupted = await mutateArray("tasks", (tasks) => {
+    const ids = []
     for (const task of tasks) {
+      if (task.status === "queued" && task.authorizedBy === "unattendedDev") {
+        task.status = "interrupted"
+        task.finishedAt = new Date().toISOString()
+        task.error = "服务在无人值守任务启动前中断；请重新请求任务"
+        ids.push(task.id)
+        continue
+      }
       if (task.status === "running" || task.status === "starting") {
         if (task.kind === "android_build" && Number.isInteger(task.runnerPid) && isPidRunning(task.runnerPid)) continue
         task.status = "interrupted"
         task.finishedAt = new Date().toISOString()
       }
     }
+    return ids.map((id) => ({ id, task: tasks.find((item) => item.id === id) }))
   })
+  for (const entry of interrupted) await audit("task_interrupted_before_start", { workspaceId: entry.task.workspaceId, itemId: entry.id, result: "interrupted" })
 }
 
 function isPidRunning(pid) {

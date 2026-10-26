@@ -13,7 +13,7 @@
     <div>
       <p class="eyebrow">LOCAL CODING BRIDGE</p>
       <h1>ChatCode</h1>
-      <p class="lede">在本机管理工作区、文件审批、检查任务和 Secure MCP Tunnel 连接。</p>
+      <p class="lede">管理工作区授权、无人值守运行、Skills、自定义工具和 Secure MCP Tunnel 连接。</p>
     </div>
     <div class="service-block">
       <div id="service" class="pill connecting" role="status" aria-live="polite">正在检查本机服务…</div>
@@ -25,6 +25,8 @@
     <button class="nav-button active" type="button" data-page="workspaces" aria-current="page">工作区</button>
     <button class="nav-button" type="button" data-page="changes">变更审批</button>
     <button class="nav-button" type="button" data-page="tasks">项目检查</button>
+    <button class="nav-button" type="button" data-page="skills">Skills</button>
+    <button class="nav-button" type="button" data-page="tools">自定义工具</button>
     <button class="nav-button" type="button" data-page="settings">连接设置</button>
     <button class="nav-button" type="button" data-page="logs">运行日志</button>
   </nav>
@@ -63,13 +65,30 @@
       </section>
     </section>
 
+    <section id="page-skills" class="page" hidden>
+      <section class="panel">
+        <div class="section-title"><div><p class="eyebrow">04 / CODEX SKILLS</p><h2>本机 Codex Skills</h2></div><p>只读索引；Skill 内容属于不可信参考资料，不会增加工作区、Shell 或设备权限。</p></div>
+        <div class="actions"><button id="refresh-skills" class="secondary" type="button">重新扫描 Skills</button></div>
+        <div id="skills" class="cards"></div>
+      </section>
+    </section>
+
+    <section id="page-tools" class="page" hidden>
+      <section class="panel">
+        <div class="section-title"><div><p class="eyebrow">05 / CUSTOM TOOLS</p><h2>自定义工具包</h2></div><p>工具来自 ChatCode 源码中的静态注册目录；工作区文件和远程网络不会提供可执行 JavaScript。</p></div>
+        <div class="actions"><button id="reload-custom-tools" class="secondary" type="button">重新读取 Manifest</button></div>
+        <div id="custom-tools" class="cards"></div>
+      </section>
+    </section>
+
     <section id="page-settings" class="page" hidden>
       <section class="panel">
-        <div class="section-title"><div><p class="eyebrow">04 / CONNECTION</p><h2>本机与连接状态</h2></div><p>本机服务、MCP、Tunnel 和 ChatGPT 应用分别报告。</p></div>
+        <div class="section-title"><div><p class="eyebrow">06 / CONNECTION</p><h2>本机与连接状态</h2></div><p>本机服务、MCP、Tunnel 和 ChatGPT 应用分别报告。</p></div>
         <div id="connection-status" class="status-grid">
           <article class="status-card"><div class="status-head"><strong>本机 HTTP 服务</strong><span id="http-badge" class="badge">检查中</span></div><p id="http-detail" class="meta">读取本机管理服务状态…</p></article>
           <article class="status-card"><div class="status-head"><strong>MCP stdio</strong><span id="mcp-badge" class="badge">尚未测试</span></div><p id="mcp-detail" class="meta">本地工具服务可独立测试，不需要 Tunnel 凭据。</p><button id="test-mcp" class="secondary" type="button">测试本机 MCP</button></article>
-          <article class="status-card"><div class="status-head"><strong>Secure MCP Tunnel</strong><span id="tunnel-badge" class="badge">未配置</span></div><p id="tunnel-detail" class="meta">Tunnel 正在使用当前配置检查。</p></article>
+          <article class="status-card"><div class="status-head"><strong>HTTP 代理</strong><span id="proxy-badge" class="badge">尚未测试</span></div><p id="proxy-detail" class="meta">代理 TCP 与 OpenAI API 探测分别显示。</p></article>
+          <article class="status-card"><div class="status-head"><strong>Tunnel 控制平面</strong><span id="tunnel-badge" class="badge">未配置</span></div><p id="tunnel-detail" class="meta">以真实控制平面轮询状态判断连接；本机进程就绪不代表已连通。</p></article>
           <article class="status-card"><div class="status-head"><strong>ChatGPT 应用与网页端调用</strong><span id="chatgpt-badge" class="badge">需网页确认</span></div><p id="chatgpt-detail" class="meta">Tunnel 运行不代表 ChatGPT 已注册应用或成功调用工具。</p></article>
         </div>
         <div class="actions">
@@ -81,7 +100,7 @@
       </section>
 
       <section class="panel">
-        <div class="section-title"><div><p class="eyebrow">05 / TUNNEL PROFILE</p><h2>连接配置</h2></div><p>只连接现有 Tunnel；ChatCode 不会自动创建 Tunnel 或索取高权限管理密钥。</p></div>
+        <div class="section-title"><div><p class="eyebrow">07 / TUNNEL PROFILE</p><h2>连接配置</h2></div><p>只连接现有 Tunnel；ChatCode 不会自动创建 Tunnel 或索取高权限管理密钥。</p></div>
         <div class="protocol-note">
           <strong>当前模式：本地 stdio MCP + 官方 Secure MCP Tunnel</strong>
           <p>模型推理由 ChatGPT 网页承担。这里不需要另购模型 API Key。Runtime API Key 只用于 tunnel-client 向 OpenAI Tunnel 控制平面认证。</p>
@@ -90,17 +109,23 @@
           <label>Tunnel ID<input name="tunnelId" maxlength="256" placeholder="从 OpenAI Platform 的 Tunnels 页面复制"></label>
           <label>官方 tunnel-client.exe 绝对路径<input name="clientPath" maxlength="2048" placeholder="例如 D:\Tools\tunnel-client.exe"></label>
           <label>独立 Profile 标识<input name="profile" maxlength="64" value="chatcode-local" pattern="[a-z0-9][a-z0-9_-]{0,63}"></label>
+          <label>出站代理模式<select name="proxyMode"><option value="http">迷雾通 HTTP 代理（推荐）</option><option value="system">系统 HTTP(S) 代理</option><option value="direct">直连</option></select></label>
+          <label id="proxy-url-field">HTTP 代理地址<input name="proxyUrl" maxlength="512" value="http://127.0.0.1:9910" placeholder="http://127.0.0.1:9910"></label>
+          <p class="hint proxy-hint">只对 tunnel-client 专属进程生效。迷雾通强制模式会禁用 API 直连回退；本地 MCP stdio 不经过 HTTP 代理。当前保存值优先于继承的系统代理环境。</p>
           <div class="profile-location"><span class="hint">Profile 文件目录</span><code id="profile-path">保存配置后显示</code></div>
           <div class="actions settings-actions">
             <button id="detect-client" class="secondary" type="button">检测客户端</button>
             <button id="save-settings" type="submit">保存配置</button>
+            <button id="test-proxy-tcp" class="secondary" type="button">测试代理 TCP</button>
+            <button id="test-proxy-api" class="secondary" type="button">测试经代理 API</button>
+            <button id="apply-reconnect" type="button">应用并安全重连</button>
           </div>
         </form>
         <div id="client-message" class="notice" role="status" aria-live="polite" hidden></div>
       </section>
 
       <section class="panel">
-        <div class="section-title"><div><p class="eyebrow">06 / RUNTIME KEY</p><h2>Runtime API Key</h2></div><span id="credential-badge" class="badge">未配置</span></div>
+        <div class="section-title"><div><p class="eyebrow">08 / RUNTIME KEY</p><h2>Runtime API Key</h2></div><span id="credential-badge" class="badge">未配置</span></div>
         <p class="hint key-explanation">密钥使用密码输入框，只能录入或替换；保存到 Windows Credential Manager，页面不会回显密钥。密钥不会进入 URL、data 配置、Profile、命令行或日志。</p>
         <form id="credential-form" class="credential-form" autocomplete="off">
           <label>录入或替换 Runtime API Key<input name="key" type="password" maxlength="4096" autocomplete="new-password" spellcheck="false" placeholder="粘贴 Runtime API Key"></label>

@@ -35,6 +35,8 @@ const post = (url, body = {}, timeoutMs = 12000) => api(url, { method: "POST", b
 const sessionControlIds = [
   "browse-folder", "add-workspace", "test-mcp", "detect-client", "save-settings", "save-key", "delete-key",
   "save-settings-shortcut", "check-metadata", "run-doctor", "start-tunnel", "stop-tunnel", "refresh-diagnostics", "copy-diagnostics",
+  "test-proxy-tcp", "test-proxy-api", "apply-reconnect",
+  "refresh-skills", "reload-custom-tools",
 ]
 function enableSessionControls(enabled) {
   for (const id of sessionControlIds) if (byId(id)) byId(id).disabled = !enabled
@@ -77,6 +79,10 @@ function setBadge(node, state, text) {
   node.textContent = text
 }
 
+function commaValues(value) {
+  return [...new Set(String(value ?? "").split(",").map((item) => item.trim()).filter(Boolean))]
+}
+
 function button(label, action, style = "secondary") {
   const node = el("button", style, label)
   node.type = "button"
@@ -110,6 +116,18 @@ function renderWorkspaces(items) {
     card.append(head, el("div", "meta", `绝对路径：${item.path}`), el("div", "meta", `更新时间：${item.updatedAt ?? "未知"}`))
     if (item.mode === "autoWritable") card.append(el("div", "meta", `免逐项审批授予时间：${item.autoWriteGrantedAt ?? "旧数据无记录"}`))
     if (item.allowSensitive) card.append(el("div", "meta", `敏感文件访问已单独授权：${item.sensitiveGrantedAt ?? "旧数据无记录"}`))
+    if (item.executionAuthorization) {
+      const scope = item.executionAuthorization.scope
+      const summary = [
+        `固定命令 ${scope.fixedCommands.length} 项`, `npm 脚本 ${scope.npmScripts.length} 项`,
+        `Android 项目 ${scope.androidProjects.length} 项`, scope.gitReadOnly ? "Git 只读" : null,
+        scope.gitWrite ? "受控 Git commit/worktree" : null,
+        scope.fileLifecycle ? "可恢复文件操作" : null,
+        scope.mumuInstance ? `MuMu ${scope.mumuInstance.index} · ${scope.mumuInstance.name}` : null,
+      ].filter(Boolean).join(" · ")
+      card.append(el("div", "meta", `执行授权：unattendedDev · ${summary}`))
+      card.append(el("div", "permission-note", `授权时间：${item.executionAuthorization.authorizedAt} · OS 隔离：${item.executionAuthorization.osIsolation}。当前没有 Windows Sandbox/AppContainer；被选中的脚本和 Gradle 项目仍以当前 Windows 用户权限运行。`))
+    }
     const actions = el("div", "actions")
     actions.append(button("测试访问", async () => {
       const result = await api(`/api/workspaces/${item.id}/test`)
@@ -131,6 +149,57 @@ function renderWorkspaces(items) {
     if (item.mode !== "autoWritable") actions.append(button("启用免逐项审批写入", async () => {
       if (!confirm(`确认对工作区“${item.name}”授予免逐项审批写入？普通文件创建、覆盖、编辑和目录创建不会再经过 ChatCode 本机逐文件审批。ChatGPT 平台确认、授权路径与版本冲突检查仍然生效。`)) return
       await post(`/api/workspaces/${item.id}/auto-write`, { confirmAutoWrite: true })
+      await refreshCore()
+    }))
+    if (item.executionAuthorization) actions.append(button("撤销无人值守执行授权", async () => {
+      if (!confirm(`立即撤销“${item.name}”的 unattendedDev 执行授权？运行中的任务不会自动被杀死，请使用任务页取消。`)) return
+      await post(`/api/workspaces/${item.id}/execution-profile/revoke`)
+      await refreshCore()
+    }, "danger"))
+    else if (item.mode === "autoWritable") actions.append(button("配置无人值守开发范围", async () => {
+      const npmInput = prompt("允许自动执行的现有 package.json 脚本名（逗号分隔）。只会授权当前 package.json 的精确版本。", "test")
+      if (npmInput === null) return
+      const fixedInput = prompt("允许自动执行的固定命令类型（逗号分隔）：node_test,node_check,python_test,python_compile,go_test,rust_test,dotnet_test。", "")
+      if (fixedInput === null) return
+      const androidPathInput = prompt("允许的 Android 项目工作区相对路径（例如 Calculator；留空跳过）。", "")
+      if (androidPathInput === null) return
+      const androidProjects = []
+      if (androidPathInput.trim()) {
+        const tasksInput = prompt("允许的 Gradle 固定任务（逗号分隔）：assembleDebug,testDebugUnitTest,lintDebug。", "assembleDebug,testDebugUnitTest,lintDebug")
+        if (tasksInput === null) return
+        androidProjects.push({ projectPath: androidPathInput.trim(), tasks: commaValues(tasksInput) })
+      }
+      const gitReadOnly = confirm("是否一并记录 Git status/diff 只读范围？不会启用 commit、push、reset 或 shell。")
+      const gitWrite = gitReadOnly && confirm("是否单独授权受控 Git commit 与 ChatCode 专属 worktree？仅允许预览后提交明确列出的文件，禁用 Git hooks；不包含 push、force、reset 或 clean。")
+      const fileLifecycle = confirm("是否明确授权此工作区自动执行同根目录内的 copy/move/rename 和可恢复软删除？这项权限单独关闭时，工作区普通写入仍不能删除、移动或重命名文件。")
+      let mumuInstance = null
+      let mumuActions = false
+      if (confirm("是否发现并授权一个 MuMu 实例用于本工作区 Android 调试？")) {
+        const discovery = await api("/api/mumu/instances")
+        const choices = discovery.instances.map((instance) => `${instance.index}: ${instance.name} · Android ${instance.android_version} · ${instance.player_state} · ADB ${instance.adb_host_ip}:${instance.adb_port}`).join("\n")
+        if (!choices) throw new Error("mumu-cli 当前未发现可选实例。没有保存授权。")
+        const selectedIndex = prompt(`输入唯一 MuMu index；不会选择或操作其他 VM：\n${choices}`, discovery.instances.length === 1 ? discovery.instances[0].index : "")
+        if (selectedIndex === null) return
+        const selected = discovery.instances.find((instance) => instance.index === selectedIndex.trim())
+        if (!selected) throw new Error("index 不在本机当前 MuMu 发现结果中。没有保存授权。")
+        mumuInstance = { index: selected.index }
+        mumuActions = confirm(`允许 ChatCode 在 MuMu ${selected.index} 上安装本工作区已校验的 APK、启动/停止该测试应用、输入测试按键并保存仅针对该应用的截图与 UI hierarchy？不会清理或重置 VM。`)
+      }
+      const npmScripts = commaValues(npmInput)
+      const fixedCommands = commaValues(fixedInput)
+      const selectedSummary = [
+        npmScripts.length ? `npm: ${npmScripts.join(", ")}` : null,
+        fixedCommands.length ? `固定命令: ${fixedCommands.join(", ")}` : null,
+        ...androidProjects.map((entry) => `Android ${entry.projectPath}: ${entry.tasks.join(", ")}`),
+        gitReadOnly ? "Git status/diff" : null,
+        gitWrite ? "受控 Git commit/worktree" : null,
+        fileLifecycle ? "可恢复文件 copy/move/rename/delete" : null,
+        mumuInstance ? `MuMu ${mumuInstance.index}${mumuActions ? "（允许设备操作）" : "（只读发现）"}` : null,
+      ].filter(Boolean).join("\n") || "无"
+      if (!confirm(`一次性在本机启用 unattendedDev？\n\n${selectedSummary}\n\n此权限不会开放任意 Shell。Windows OS 沙箱不可用；所有已选项目代码仍会以当前 Windows 用户权限运行。继续？`)) return
+      await post(`/api/workspaces/${item.id}/execution-profile/enable`, {
+        confirmUnattendedDev: true, npmScripts, fixedCommands, androidProjects, gitReadOnly, gitWrite, fileLifecycle, mumuInstance, mumuActions,
+      }, 30000)
       await refreshCore()
     }))
     actions.append(button(item.allowSensitive ? "撤销敏感文件访问" : "单独授权敏感文件访问", async () => {
@@ -177,8 +246,10 @@ function renderChanges(items) {
 function renderTasks(items) {
   const root = byId("tasks")
   root.replaceChildren()
-  if (!items.length) return root.append(empty("没有等待审核或最近任务。"))
-  for (const item of items.slice(0, 30)) {
+  const legacyPending = items.filter((item) => item.status === "awaiting_approval" && item.workspaceProfile === "unattendedDev")
+  const visibleItems = items.filter((item) => !(item.status === "awaiting_approval" && item.workspaceProfile === "unattendedDev"))
+  if (!visibleItems.length && !legacyPending.length) return root.append(empty("没有运行中或最近任务。"))
+  for (const item of visibleItems.slice(0, 30)) {
     const card = el("article", "card")
     const head = el("div", "card-head")
     head.append(el("div", "card-title", `${item.command} · ${item.id}`), el("span", `badge ${item.status === "succeeded" ? "ok" : ["failed", "timed_out", "cancelled", "interrupted"].includes(item.status) ? "bad" : ""}`, item.status))
@@ -197,6 +268,13 @@ function renderTasks(items) {
     if (item.output) card.append(el("pre", "output", item.output))
     root.append(card)
   }
+  if (legacyPending.length) {
+    const details = el("details", "diagnostic-details")
+    details.append(el("summary", "", `历史待审批任务（${legacyPending.length} 项）`))
+    details.append(el("div", "meta", "这些任务在 unattendedDev 授权启用前已进入手动审批队列，因此不会作为当前自动执行范围的一部分。请在本机单独检查或撤销。"))
+    for (const item of legacyPending.slice(0, 20)) details.append(el("div", "audit-row", `${item.command} · ${item.id} · ${item.workspaceDisplay ?? item.workspaceId}`))
+    root.append(details)
+  }
 }
 
 function renderAudit(items) {
@@ -208,6 +286,48 @@ function renderAudit(items) {
     row.append(el("span", "", item.at), el("strong", "", item.event), el("span", "", [item.path, item.result].filter(Boolean).join(" · ")))
     root.append(row)
   }
+}
+
+function renderSkills(data) {
+  const root = byId("skills")
+  root.replaceChildren()
+  if (data.error) root.append(el("div", "notice bad", data.error))
+  if (!data.skills.length) return root.append(empty("沒有找到可用 Skill。請檢查 CODEX_HOME/skills 或 %USERPROFILE%\\.codex\\skills。"))
+  for (const skill of data.skills) {
+    const card = el("article", "card")
+    const head = el("div", "card-head")
+    head.append(el("div", "card-title", skill.name), el("span", `badge ${skill.status === "ready" ? "ok" : "bad"}`, skill.status))
+    card.append(head, el("div", "meta", skill.description), el("div", "meta", `来源：${skill.source} · 版本：${skill.version ?? "未知"} · SHA-256：${skill.sha256 ?? "不可用"}`))
+    card.append(el("div", "meta", `只读资源 ${skill.resource_count ?? skill.resources.length} 项${skill.resources_truncated ? "（索引达到安全上限）" : ""}${skill.error ? ` · 错误：${skill.error}` : ""}`))
+    root.append(card)
+  }
+}
+
+function renderCustomTools(data) {
+  const root = byId("custom-tools")
+  root.replaceChildren()
+  const packages = data.catalog?.packages ?? []
+  if (!packages.length) root.append(empty("当前没有可用的工具包 manifest。"))
+  for (const item of packages) {
+    const card = el("article", "card")
+    const head = el("div", "card-head")
+    head.append(el("div", "card-title", `${item.title} · ${item.id}`), el("span", `badge ${item.enabled ? "ok" : ""}`, `${item.enabled ? "已启用" : "已停用"} · ${item.version}`))
+    card.append(head, el("div", "meta", item.description), el("div", "meta", `权限：${item.permission_level} · 路径：${item.path_scope} · 设备：${item.device_scope ?? "无"}`))
+    card.append(el("div", "meta", `动作：${item.tools.map((tool) => tool.mcp_name).join(", ")}`))
+    root.append(card)
+  }
+  for (const error of data.catalog?.errors ?? []) root.append(el("div", "notice bad", `${error.id}: ${error.error}`))
+  if (data.reloadResult) root.append(el("div", "notice", data.reloadResult.message))
+}
+
+async function refreshSkillsPage() {
+  renderSkills(await api("/api/skills"))
+}
+
+async function refreshCustomToolsPage(reload = false) {
+  const data = await api("/api/custom-tools")
+  if (reload) data.reloadResult = await post("/api/custom-tools/reload")
+  renderCustomTools(data)
 }
 
 function renderTunnelLogs(items) {
@@ -262,8 +382,15 @@ async function refreshCore() {
     ])
     renderWorkspaces(workspaces.workspaces)
     renderChanges(changes.changes)
-    const workspaceNames = new Map(workspaces.workspaces.map((workspace) => [workspace.id, `${workspace.name} · ${workspace.path}`]))
-    renderTasks(tasks.tasks.map((task) => ({ ...task, workspaceDisplay: workspaceNames.get(task.workspaceId) ?? task.workspaceId })))
+    const workspaceMap = new Map(workspaces.workspaces.map((workspace) => [workspace.id, workspace]))
+    renderTasks(tasks.tasks.map((task) => {
+      const workspace = workspaceMap.get(task.workspaceId)
+      return {
+        ...task,
+        workspaceDisplay: workspace ? `${workspace.name} · ${workspace.path}` : task.workspaceId,
+        workspaceProfile: workspace?.executionAuthorization?.profile ?? "manual",
+      }
+    }))
     renderAudit(audit.events)
     renderUploads(uploads.uploads, workspaces.workspaces)
     setServiceState("connected", `本机服务已连接 · 127.0.0.1:${window.location.port || "80"}`)
@@ -310,6 +437,8 @@ function showPage(name) {
   }
   if (name === "settings" && sessionReady) void refreshSettings()
   if (name === "logs" && sessionReady) void refreshLogs()
+  if (name === "skills" && sessionReady) void refreshSkillsPage()
+  if (name === "tools" && sessionReady) void refreshCustomToolsPage()
 }
 
 function statusFromMcp(value) {
@@ -323,15 +452,21 @@ function statusFromMcp(value) {
 function statusFromTunnel(value) {
   const badge = byId("tunnel-badge")
   const states = {
-    connected: ["ok", value.ready ? "已连接且就绪" : "已连接"],
-    starting: ["", "正在连接"],
+    connected: ["ok", "控制平面轮询成功"],
+    control_plane_degraded: ["bad", "控制平面轮询失败"],
+    waiting_proxy: ["bad", "等待代理恢复"],
+    starting: ["", "等待首次轮询"],
     error: ["bad", "连接出错"],
     disconnected: ["", "未连接"],
     not_configured: ["", "未配置"],
   }
   const [tone, label] = states[value.status] ?? ["", value.status ?? "未知"]
   setBadge(badge, tone, label)
-  const lines = [value.message]
+  const poll = value.controlPlane ?? {}
+  const mcp = value.mcp ?? {}
+  const lines = [value.message, `本机 Tunnel：${value.running ? "运行中" : "未运行"} · 控制平面：${poll.status ?? "unknown"}/${poll.state ?? "not_observed"}`]
+  if (poll.consecutiveFailures) lines.push(`连续轮询失败：${poll.consecutiveFailures} · 下次重试：${poll.nextRetry ?? "由客户端决定"}`)
+  if (mcp.initialized || mcp.toolsDiscovered) lines.push(`Tunnel 子进程 MCP：${mcp.initialized ? "initialize 成功" : "未初始化"} · tools/list ${mcp.toolsDiscovered ? `${mcp.toolCount} 项${mcp.toolsComplete ? "（完整）" : "（部分）"}` : "尚未观察"}`)
   if (value.healthUrl) lines.push(`本机 Tunnel health：${value.healthUrl}`)
   if (value.credentialConfigured === false) lines.push("Runtime API Key 尚未录入。")
   if (value.clientConfigured === false) lines.push("尚未填写 tunnel-client.exe 路径。")
@@ -340,12 +475,27 @@ function statusFromTunnel(value) {
   setBadge(byId("credential-badge"), configured ? "ok" : "", configured ? "已安全保存" : "未配置")
 }
 
+function statusFromProxy(value) {
+  const tcp = value?.tcp
+  const api = value?.api
+  if (api?.status === "reachable") setBadge(byId("proxy-badge"), "ok", `API 可达 · HTTP ${api.httpStatus}`)
+  else if (api?.status === "rate_limited") setBadge(byId("proxy-badge"), "bad", "API 探测收到 429")
+  else if (tcp?.status === "available") setBadge(byId("proxy-badge"), "ok", "TCP 可达 · API 未验证")
+  else if (tcp?.status === "unavailable" || api?.status === "unavailable") setBadge(byId("proxy-badge"), "bad", "代理不可用")
+  else setBadge(byId("proxy-badge"), "", "尚未测试")
+  const lines = [tcp?.message, api?.message]
+  if (tcp?.checkedAt) lines.push(`TCP 检查：${tcp.checkedAt}`)
+  if (api?.requestId) lines.push(`API request ID：${api.requestId}`)
+  byId("proxy-detail").textContent = lines.filter(Boolean).join(" ") || "保存设置后可分别测试代理 TCP 和 OpenAI API。"
+}
+
 function renderDiagnostics(data) {
   diagnosticsData = data
   setBadge(byId("http-badge"), "ok", "已连接")
   byId("http-detail").textContent = `监听地址：${data.management.bind}:${data.management.port} · 健康检查：${data.management.healthUrl} · PID ${data.management.pid}`
   statusFromMcp(data.mcp)
   statusFromTunnel(data.tunnel)
+  statusFromProxy(data.proxy)
   setBadge(byId("chatgpt-badge"), "", "需网页确认")
   byId("chatgpt-detail").textContent = data.chatgpt.message
   byId("diagnostics-output").textContent = JSON.stringify({
@@ -361,9 +511,15 @@ function renderDiagnostics(data) {
       clientConfigured: data.tunnel.clientConfigured,
       tunnelIdConfigured: data.tunnel.tunnelIdConfigured,
       profile: data.tunnel.profile,
+      proxyMode: data.tunnel.proxyMode,
+      proxyUrl: data.tunnel.proxyUrl,
       message: data.tunnel.message,
+      controlPlane: data.tunnel.controlPlane,
+      mcp: data.tunnel.mcp,
+      clientProxy: data.tunnel.clientProxy,
       lastError: data.tunnel.lastError,
     },
+    proxy: data.proxy,
     chatgpt: data.chatgpt,
     tunnelEvents: data.tunnelEvents,
   }, null, 2)
@@ -377,6 +533,9 @@ async function refreshSettings() {
     form.elements.tunnelId.value = saved.settings.tunnelId
     form.elements.clientPath.value = saved.settings.clientPath
     form.elements.profile.value = saved.settings.profile
+    form.elements.proxyMode.value = saved.settings.proxyMode
+    form.elements.proxyUrl.value = saved.settings.proxyUrl
+    updateProxyModeFields()
     byId("profile-path").textContent = saved.profilePath
     setBadge(byId("credential-badge"), saved.credentialConfigured ? "ok" : "", saved.credentialConfigured ? "已安全保存" : "未配置")
     renderDiagnostics(diagnostics)
@@ -463,6 +622,20 @@ byId("browse-folder").addEventListener("click", async () => {
 
 byId("retry-connection").addEventListener("click", () => { void initialize() })
 for (const tab of document.querySelectorAll(".nav-button")) tab.addEventListener("click", () => showPage(tab.dataset.page))
+byId("refresh-skills").addEventListener("click", async () => {
+  if (!sessionReady) return showNotice(globalMessage, "请先连接本机服务。", "bad")
+  byId("refresh-skills").disabled = true
+  try { renderSkills(await post("/api/skills/refresh")) }
+  catch (error) { showNotice(globalMessage, error.message, "bad") }
+  finally { byId("refresh-skills").disabled = false }
+})
+byId("reload-custom-tools").addEventListener("click", async () => {
+  if (!sessionReady) return showNotice(globalMessage, "请先连接本机服务。", "bad")
+  byId("reload-custom-tools").disabled = true
+  try { await refreshCustomToolsPage(true) }
+  catch (error) { showNotice(globalMessage, error.message, "bad") }
+  finally { byId("reload-custom-tools").disabled = false }
+})
 
 byId("test-mcp").addEventListener("click", async () => {
   if (!sessionReady) return showNotice(byId("settings-message"), "请先连接本机服务。", "bad")
@@ -484,6 +657,14 @@ byId("test-mcp").addEventListener("click", async () => {
 })
 
 const settingsForm = byId("tunnel-settings-form")
+function updateProxyModeFields() {
+  const useUrl = settingsForm.elements.proxyMode.value === "http"
+  byId("proxy-url-field").hidden = !useUrl
+  settingsForm.elements.proxyUrl.disabled = !useUrl
+}
+
+settingsForm.elements.proxyMode.addEventListener("change", updateProxyModeFields)
+
 async function saveSettings() {
   if (!sessionReady) throw new Error("安全会话尚未连接")
   const buttonNode = byId("save-settings")
@@ -493,6 +674,8 @@ async function saveSettings() {
       tunnelId: settingsForm.elements.tunnelId.value.trim(),
       clientPath: settingsForm.elements.clientPath.value.trim(),
       profile: settingsForm.elements.profile.value.trim(),
+      proxyMode: settingsForm.elements.proxyMode.value,
+      proxyUrl: settingsForm.elements.proxyUrl.value.trim(),
     }, 30000)
     byId("profile-path").textContent = result.profilePath
     const message = result.profileReady ? "配置已保存，官方客户端已生成独立 Profile。" : `配置已保存。${result.warning}`
@@ -557,8 +740,10 @@ async function runTunnelOperation(buttonId, endpoint, pending, success) {
   buttonNode.disabled = true
   showNotice(byId("tunnel-operation-message"), pending, "working")
   try {
-    const result = await post(endpoint, {}, endpoint === "/api/tunnel/start" ? 70000 : 35000)
-    showNotice(byId("tunnel-operation-message"), result.message ?? success, result.status === "error" ? "bad" : "ok")
+    const timeoutMs = endpoint === "/api/tunnel/start" || endpoint === "/api/tunnel/reconnect" ? 95000 : 35000
+    const result = await post(endpoint, {}, timeoutMs)
+    const failed = ["error", "waiting_proxy", "control_plane_degraded"].includes(result.status)
+    showNotice(byId("tunnel-operation-message"), result.message ?? success, failed ? "bad" : "ok")
     await refreshSettings()
   } catch (error) {
     showNotice(byId("tunnel-operation-message"), `${error.message}`, "bad")
@@ -571,6 +756,38 @@ byId("run-doctor").addEventListener("click", () => { void runTunnelOperation("ru
 byId("start-tunnel").addEventListener("click", () => { void runTunnelOperation("start-tunnel", "/api/tunnel/start", "正在启动受控的 tunnel-client 连接…", "Tunnel 已启动。") })
 byId("stop-tunnel").addEventListener("click", () => { void runTunnelOperation("stop-tunnel", "/api/tunnel/stop", "正在停止 ChatCode 管理的 Tunnel…", "Tunnel 已断开。") })
 byId("refresh-diagnostics").addEventListener("click", () => { void refreshSettings() })
+
+async function runProxyTest(buttonId, endpoint, pending) {
+  const buttonNode = byId(buttonId)
+  buttonNode.disabled = true
+  try {
+    await saveSettings()
+    showNotice(byId("settings-message"), pending, "working")
+    const result = await post(endpoint, {}, 16000)
+    showNotice(byId("settings-message"), result.message, ["unavailable", "rate_limited", "api_error"].includes(result.status) ? "bad" : "ok")
+    await refreshSettings()
+  } catch (error) {
+    showNotice(byId("settings-message"), `代理测试失败：${error.message}`, "bad")
+  } finally { buttonNode.disabled = false }
+}
+
+byId("test-proxy-tcp").addEventListener("click", () => { void runProxyTest("test-proxy-tcp", "/api/tunnel/proxy/tcp", "正在测试已保存代理地址的 TCP 连接…") })
+byId("test-proxy-api").addEventListener("click", () => { void runProxyTest("test-proxy-api", "/api/tunnel/proxy/api", "正在经所选路径对 OpenAI API 发送不带 Key 的 HEAD 探测…") })
+byId("apply-reconnect").addEventListener("click", async () => {
+  const buttonNode = byId("apply-reconnect")
+  buttonNode.disabled = true
+  showNotice(byId("tunnel-operation-message"), "正在保存代理设置并安全停止/重连专属 Tunnel…", "working")
+  try {
+    await saveSettings()
+    const result = await post("/api/tunnel/reconnect", {}, 95000)
+    const failed = ["error", "waiting_proxy", "control_plane_degraded"].includes(result.status)
+    showNotice(byId("tunnel-operation-message"), result.message ?? "已应用设置并完成重连。", failed ? "bad" : "ok")
+    await refreshSettings()
+  } catch (error) {
+    showNotice(byId("tunnel-operation-message"), `应用并重连失败：${error.message}`, "bad")
+    await refreshSettings()
+  } finally { buttonNode.disabled = false }
+})
 
 byId("copy-diagnostics").addEventListener("click", async () => {
   if (!diagnosticsData) return showNotice(byId("settings-message"), "请先刷新连接诊断。", "bad")
@@ -587,9 +804,14 @@ byId("copy-diagnostics").addEventListener("click", async () => {
       credentialConfigured: data.tunnel.credentialConfigured,
       clientConfigured: data.tunnel.clientConfigured,
       tunnelIdConfigured: data.tunnel.tunnelIdConfigured,
+      proxyMode: data.tunnel.proxyMode,
+      controlPlane: data.tunnel.controlPlane,
+      mcp: data.tunnel.mcp,
+      clientProxy: data.tunnel.clientProxy,
       message: data.tunnel.message,
       lastError: data.tunnel.lastError,
     },
+    proxy: data.proxy,
     chatgpt: data.chatgpt,
   }
   try {

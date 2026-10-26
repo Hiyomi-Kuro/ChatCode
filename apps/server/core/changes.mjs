@@ -8,6 +8,7 @@ import { hasBlockedExplicitDirectory, normalizeRelative } from "./paths.mjs"
 import { isSensitiveAllowed, rejectManagedStatePath, requireWorkspace, getWorkspace } from "./workspaces.mjs"
 import { createStagedBlob, discardUploadFiles, markUploadApplied, uploadFilePath } from "./uploads.mjs"
 import { TMP_DIR } from "./config.mjs"
+import { invalidateWorkspaceLsp } from "./lsp.mjs"
 
 const MAX_CHANGE_BYTES = 1_048_576
 
@@ -54,6 +55,7 @@ export async function stageFileWrite({ workspace_id, path, content, expected_sha
       if (currentWorkspace.mode === "autoWritable") {
         const result = await createNewFile(currentWorkspace.root, relative, Buffer.from(content, "utf8"))
         await audit("file_written_direct", { workspaceId: currentWorkspace.id, path: relative, result: "created" })
+        await invalidateWorkspaceLsp(currentWorkspace.id).catch(() => {})
         return { path: relative, sha256_before: null, sha256_after: result.sha256, status: "applied", requires_local_approval: false, bytes: result.bytes }
       }
     }
@@ -69,6 +71,7 @@ export async function stageFileWrite({ workspace_id, path, content, expected_sha
       if (currentWorkspace.mode === "autoWritable") {
         const result = await writeExistingFile(currentWorkspace.root, relative, oldHash, Buffer.from(content, "utf8"))
         await audit("file_written_direct", { workspaceId: currentWorkspace.id, path: relative, result: "updated" })
+        await invalidateWorkspaceLsp(currentWorkspace.id).catch(() => {})
         return { path: relative, sha256_before: oldHash, sha256_after: result.sha256, status: "applied", requires_local_approval: false, bytes: result.bytes }
       }
     }
@@ -212,6 +215,7 @@ export async function stageUnifiedPatch({ workspace_id, unified_patch, expected_
   if (workspace.mode === "autoWritable") {
     const appliedCount = directResults.filter((item) => item.status === "applied").length
     const failureCount = directResults.length - appliedCount
+    if (appliedCount) await invalidateWorkspaceLsp(workspace.id).catch(() => {})
     return {
       batch_id: batchId, status: failureCount ? "partial_failure" : "applied", per_file_approval: false,
       applied_count: appliedCount, failed_count: failureCount,
@@ -250,6 +254,7 @@ export async function stageDirectoryCreate({ workspace_id, path }) {
     if (currentWorkspace.mode === "autoWritable") {
       const result = await createDirectory(currentWorkspace.root, relative)
       await audit("directory_created_direct", { workspaceId: currentWorkspace.id, path: relative, result: "created" })
+      await invalidateWorkspaceLsp(currentWorkspace.id).catch(() => {})
       return { path: relative, status: "applied", requires_local_approval: false, created: result.created }
     }
   }
@@ -320,6 +325,7 @@ export async function applyChange(id) {
     if (change.uploadedFileId) await markUploadApplied(change.uploadedFileId)
     else if (change.proposedBlobId) await discardUploadFiles(change.proposedBlobId)
     await audit("change_applied", { workspaceId: workspace.id, path: change.path, itemId: id, result: "applied" })
+    await invalidateWorkspaceLsp(workspace.id).catch(() => {})
     return { change_id: id, path: change.path, sha256: result.sha256 ?? null, status: "applied" }
   } catch (error) {
     await mutateArray("changes", (changes) => {
@@ -366,6 +372,7 @@ export async function recoverChange(id) {
       item.failure = null
     })
     await audit("change_recovered", { workspaceId: change.workspaceId, path: change.path, itemId: id, result: "reverted" })
+    await invalidateWorkspaceLsp(change.workspaceId).catch(() => {})
     return { change_id: id, path: change.path, status: "reverted" }
   } catch (error) {
     await mutateArray("changes", (changes) => {

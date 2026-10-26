@@ -171,6 +171,16 @@ test("MCP stdio: discovery, bounded reads, approvals, file writes, directory cre
     const catalog = await client.listTools()
     const names = new Set(catalog.tools.map((tool) => tool.name))
     const toolMap = new Map(catalog.tools.map((tool) => [tool.name, tool]))
+    const legacyNames = JSON.parse(await readFile(path.join(projectRoot, "tests", "legacy-mcp-tools.json"), "utf8"))
+    assert.equal(legacyNames.length, 42, "the original ChatCode MCP baseline has 42 tool names")
+    for (const name of legacyNames) assert.ok(names.has(name), `legacy MCP tool disappeared: ${name}`)
+    const phase9Names = [
+      "get_path_manifest", "copy_path", "move_path", "rename_path", "delete_path", "restore_deleted_path", "list_recovery_items", "recover_file_operation", "apply_file_operations",
+      "get_lsp_status", "get_file_diagnostics", "get_workspace_diagnostics", "go_to_definition", "find_references", "get_document_symbols", "search_workspace_symbols", "get_hover",
+      "get_code_search_status", "search_code", "cancel_code_search",
+      "get_git_runtime_status", "git_log", "git_branch", "git_preview_commit", "git_commit", "recover_git_commit", "git_create_worktree", "git_list_worktrees", "git_remove_worktree",
+    ]
+    for (const name of phase9Names) assert.ok(names.has(name), `missing Phase 9 MCP tool: ${name}`)
     for (const name of ["list_workspaces", "read_file", "read_file_chunk", "begin_write", "write_chunk", "commit_write", "abort_write", "write_file", "git_status", "git_diff", "stage_file_write", "stage_unified_patch", "apply_change", "request_project_check", "run_approved_check"]) assert.ok(names.has(name), `missing MCP tool: ${name}`)
     assert.equal(names.has("update_workspace"), false, "MCP must not expose workspace permission changes")
     assert.equal(toolMap.get("read_file").annotations.readOnlyHint, true)
@@ -178,6 +188,15 @@ test("MCP stdio: discovery, bounded reads, approvals, file writes, directory cre
     assert.equal(toolMap.get("apply_change").annotations.destructiveHint, true)
     assert.equal(toolMap.get("abort_write").annotations.destructiveHint, false)
     assert.equal(toolMap.get("abort_write").annotations.idempotentHint, true)
+
+    const currentCatalog = await client.callTool({ name: "get_tool_catalog", arguments: {} })
+    assert.notEqual(currentCatalog.isError, true, JSON.stringify(currentCatalog))
+    const catalogNames = Object.values(currentCatalog.structuredContent.groups).flat().map((item) => item.name).sort()
+    assert.deepEqual(catalogNames, [...names].sort(), "get_tool_catalog and tools/list must report the same names")
+    for (const capabilityTool of ["get_lsp_status", "get_code_search_status", "get_git_runtime_status"]) {
+      const capability = await client.callTool({ name: capabilityTool, arguments: {} })
+      assert.notEqual(capability.isError, true, JSON.stringify(capability))
+    }
 
     const listed = await client.callTool({ name: "list_workspaces", arguments: {} })
     assert.notEqual(listed.isError, true)
@@ -237,7 +256,7 @@ test("MCP stdio: discovery, bounded reads, approvals, file writes, directory cre
     }
 
     const regex = await client.callTool({ name: "search_text", arguments: { workspace_id: workspaceId, query: "import.+from", regex: true } })
-    assert.notEqual(regex.isError, true)
+    assert.notEqual(regex.isError, true, JSON.stringify(regex))
     assert.equal(regex.structuredContent.matches[0].path, "src/app.ts")
 
     await writeFile(path.join(workspaceRoot, "search-cursor.txt"), "CURSOR_MATCH one\nCURSOR_MATCH two\nCURSOR_MATCH three\n", "utf8")
@@ -596,7 +615,10 @@ test("MCP stdio: discovery, bounded reads, approvals, file writes, directory cre
     assert.equal(autoPatch.structuredContent.applied_count, 2)
     assert.equal(autoPatch.structuredContent.failed_count, 0)
     assert.equal(await readFile(path.join(workspaceRoot, "patch-one.txt"), "utf8"), "after one\n")
-    for (const item of autoPatch.structuredContent.recovery_paths) assert.equal((await adminPost(`/api/changes/${item.change_id}/recover`)).status, 200)
+    for (const item of autoPatch.structuredContent.recovery_paths) {
+      const response = await adminPost(`/api/changes/${item.change_id}/recover`)
+      assert.equal(response.status, 200, `${item.path}: ${await response.text()}`)
+    }
     assert.equal(await readFile(path.join(workspaceRoot, "patch-one.txt"), "utf8"), textOne)
 
     const directCreate = await client.callTool({ name: "stage_file_write", arguments: { workspace_id: workspaceId, path: "direct-edit.txt", content: "direct version\n", create: true } })

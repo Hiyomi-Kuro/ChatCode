@@ -12,7 +12,7 @@ import { CHATCODE_HOME, DATA_DIR, TMP_DIR } from "./config.mjs"
 import { createDirectory, fileExists, fileInfo, hashFile, listDirectory, readFileBytes, writeStagedFile } from "./safe-fs.mjs"
 import { hasBlockedExplicitDirectory, isPathWithin, normalizeRelative } from "./paths.mjs"
 import { assertRegularFile, mutateArray, readArray } from "./state.mjs"
-import { requireWorkspace } from "./workspaces.mjs"
+import { getUnattendedDevGrant, requireWorkspace } from "./workspaces.mjs"
 import { finishTask, getTask, launchApprovedProcess, linkAgentJob } from "./tasks.mjs"
 
 const execFileAsync = promisify(execFileCallback)
@@ -520,6 +520,9 @@ export async function requestAndroidBuild({ workspace_id, project_path, task = "
   const project = await projectLocation(workspace, project_path)
   const execution = await executionPlan(workspace, project.projectPath, task)
   const fingerprint = await buildFingerprint(workspace.root, project.projectPath)
+  const authorization = await getUnattendedDevGrant(workspace, {
+    kind: "android_build", projectPath: project.projectPath, task,
+  })
   if (agent_task_id !== undefined || agent_step_index !== undefined) {
     if (typeof agent_task_id !== "string" || !Number.isInteger(agent_step_index) || agent_step_index < 0) throw new Error("agent_task_id 和 agent_step_index 必须一起提供")
     const agents = await readArray("agentTasks")
@@ -536,7 +539,16 @@ export async function requestAndroidBuild({ workspace_id, project_path, task = "
     executablePath: execution.executable, arguments: execution.args,
     environment: execution.environment, timeoutMs: execution.timeoutMs,
     logRelativePath: execution.logRelativePath,
-    status: "awaiting_approval", requestedAt: new Date().toISOString(),
+    status: authorization ? "queued" : "awaiting_approval", requestedAt: new Date().toISOString(),
+    authorizedBy: authorization ? "unattendedDev" : "localApproval",
+    authorizationId: authorization?.authorizationId ?? null,
+    executorFingerprint: authorization ? {
+      processPath: process.execPath,
+      processSha256: createHash("sha256").update(await readFile(process.execPath)).digest("hex"),
+      executablePath: execution.executable,
+      executableSha256: createHash("sha256").update(await readFile(execution.executable)).digest("hex"),
+      argumentsSha256: createHash("sha256").update(JSON.stringify(execution.args)).digest("hex"),
+    } : null,
     startedAt: null, finishedAt: null, exitCode: null, signal: null,
     agentTaskId: agent_task_id ?? null, agentStepIndex: agent_step_index ?? null,
   }
@@ -546,21 +558,42 @@ export async function requestAndroidBuild({ workspace_id, project_path, task = "
     if (active) throw new Error(`Calculator 已有 Android 构建运行中（${active.id}）；同一项目不能并发写入 build 输出`)
     tasks.push(taskRecord)
   })
-  if (agent_task_id !== undefined) await linkAgentJob(agent_task_id, agent_step_index, taskRecord, "awaiting_user", "等待本机批准 Android Gradle 构建。")
-  await audit("android_build_requested", { workspaceId: workspace.id, itemId: taskRecord.id, result: "awaiting_approval" })
+  if (agent_task_id !== undefined && !authorization) await linkAgentJob(agent_task_id, agent_step_index, taskRecord, "awaiting_user", "等待本机批准 Android Gradle 构建。")
+  await audit(authorization ? "android_build_authorized_queued" : "android_build_requested", { workspaceId: workspace.id, itemId: taskRecord.id, result: taskRecord.status })
+  if (authorization) {
+    setImmediate(() => {
+      void runApprovedAndroidBuild({ task_id: taskRecord.id }).catch(async (error) => {
+        const current = (await readArray("tasks").catch(() => [])).find((item) => item.id === taskRecord.id)
+        if (current && ["queued", "starting", "running"].includes(current.status)) {
+          await finishTask(taskRecord.id, { status: "failed", exitCode: null, signal: null,
+            error: String(error?.message ?? "无人值守 Android runner 启动失败") }).catch(() => {})
+        }
+        await audit("android_build_unattended_start_failed", {
+          workspaceId: workspace.id, itemId: taskRecord.id,
+          result: String(error?.message ?? "worker start failed").replace(/[\r\n\0]+/g, " ").slice(0, 300),
+        }).catch(() => {})
+      })
+    })
+  }
   return {
     task_id: taskRecord.id, status: taskRecord.status, project_path: project.projectPath,
     task, command: execution.command, preview: execution.preview,
     build_input_sha256: fingerprint.sha256, build_input_files: fingerprint.files,
-    requires_local_approval: true,
+    requires_local_approval: !authorization,
+    authorization_id: authorization?.authorizationId ?? null,
   }
 }
 
 export async function runApprovedAndroidBuild({ task_id }) {
   const task = (await readArray("tasks")).find((item) => item.id === task_id)
   if (!task || task.kind !== "android_build") throw new Error("找不到 Android build task")
-  if (task.status !== "approved") throw new Error("Android build task 尚未由本机用户批准")
+  const isAuthorizedQueue = task.status === "queued" && task.authorizedBy === "unattendedDev"
+  if (task.status !== "approved" && !isAuthorizedQueue) throw new Error("Android build task 尚未由本机用户批准或无人值守授权")
   const workspace = await requireWorkspace(task.workspaceId, { writable: true })
+  if (task.authorizedBy === "unattendedDev") {
+    const authorization = await getUnattendedDevGrant(workspace, { kind: "android_build", projectPath: task.projectPath, task: task.buildTask })
+    if (authorization?.authorizationId !== task.authorizationId) throw new Error("Android build 的无人值守授权已撤销或变化")
+  }
   const project = await projectLocation(workspace, task.projectPath)
   const fingerprint = await buildFingerprint(workspace.root, project.projectPath)
   if (fingerprint.sha256 !== task.buildInputSha256) throw new Error("Gradle project 在本机审批后发生变化；请重新请求并审批")
@@ -568,6 +601,16 @@ export async function runApprovedAndroidBuild({ task_id }) {
   if (execution.executable !== task.executablePath || JSON.stringify(execution.args) !== JSON.stringify(task.arguments) ||
       execution.command !== task.command || JSON.stringify(execution.environment) !== JSON.stringify(task.environment)) {
     throw new Error("Android build 命令或环境在审批后发生变化；请重新请求并审批")
+  }
+  if (task.authorizedBy === "unattendedDev") {
+    const currentFingerprint = {
+      processPath: process.execPath,
+      processSha256: createHash("sha256").update(await readFile(process.execPath)).digest("hex"),
+      executablePath: execution.executable,
+      executableSha256: createHash("sha256").update(await readFile(execution.executable)).digest("hex"),
+      argumentsSha256: createHash("sha256").update(JSON.stringify(execution.args)).digest("hex"),
+    }
+    if (JSON.stringify(currentFingerprint) !== JSON.stringify(task.executorFingerprint)) throw new Error("Android 执行器指纹与排队时不一致；拒绝无人值守构建")
   }
   const temporary = `${project.projectPath}/.tmp`
   const gradleUserHome = `${temporary}/gradle-user-home`
@@ -577,7 +620,7 @@ export async function runApprovedAndroidBuild({ task_id }) {
   await ensureCleanGradleUserHome(workspace.root, gradleUserHome)
   await mutateArray("tasks", (tasks) => {
     const item = tasks.find((entry) => entry.id === task_id)
-    if (!item || item.status !== "approved") throw new Error("Android build task 尚未由本机用户批准")
+    if (!item || (item.status !== "approved" && !(item.status === "queued" && item.authorizedBy === "unattendedDev"))) throw new Error("Android build task 尚未由本机用户批准或无人值守授权")
     const blocker = tasks.find((entry) => entry.id !== task_id && entry.kind === "android_build" && entry.workspaceId === item.workspaceId &&
       String(entry.projectPath).toLowerCase() === String(item.projectPath).toLowerCase() && (
         ["starting", "running"].includes(entry.status) ||
@@ -642,6 +685,10 @@ export async function runAndroidBuildWorker(taskId) {
     const task = (await readArray("tasks")).find((item) => item.id === taskId)
     if (!task || task.kind !== "android_build" || task.status !== "starting") throw new Error("Android runner 找不到已批准的 starting 任务")
     const workspace = await requireWorkspace(task.workspaceId, { writable: true })
+    if (task.authorizedBy === "unattendedDev") {
+      const authorization = await getUnattendedDevGrant(workspace, { kind: "android_build", projectPath: task.projectPath, task: task.buildTask })
+      if (authorization?.authorizationId !== task.authorizationId) throw new Error("Android runner 的无人值守授权已撤销或变化")
+    }
     const project = await projectLocation(workspace, task.projectPath)
     const fingerprint = await buildFingerprint(workspace.root, project.projectPath)
     if (fingerprint.sha256 !== task.buildInputSha256) throw new Error("Gradle project 在 runner 启动前发生变化；请重新申请并审批")

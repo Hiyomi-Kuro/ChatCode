@@ -8,6 +8,7 @@ import { hasBlockedExplicitDirectory, normalizeRelative } from "./paths.mjs"
 import { getWorkspace, isSensitiveAllowed, rejectManagedStatePath, requireWorkspace } from "./workspaces.mjs"
 import { ensureLayout, assertRegularFile, mutateArray } from "./state.mjs"
 import { TMP_DIR } from "./config.mjs"
+import { invalidateWorkspaceLsp } from "./lsp.mjs"
 
 const UPLOAD_DIR = path.join(TMP_DIR, "uploads")
 const CHUNK_BYTES = 262_144
@@ -284,6 +285,7 @@ export async function commitWrite({ upload_id }) {
           bytes: result.sizeBytes ?? proposed.sizeBytes, recovery_path: null,
         }
         await audit("file_written_direct", { workspaceId: workspace.id, path: meta.path, itemId: id, result: "uploaded" })
+        await invalidateWorkspaceLsp(workspace.id).catch(() => {})
         await rm(locations.data, { force: true })
       } else {
         let backupId = null

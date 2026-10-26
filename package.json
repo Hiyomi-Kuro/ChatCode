@@ -11,8 +11,13 @@
     "mcp": "node apps/server/mcp.mjs",
     "test": "node --test",
     "test:browser": "node tests/admin.browser.e2e.mjs",
-    "test:harness": "node --test tests/mcp.integration.test.mjs tests/agent-command.integration.test.mjs tests/android-harness.unit.test.mjs tests/android-task-recovery.test.mjs tests/android-admin-approval.test.mjs",
-    "test:agent-e2e": "node --test tests/agent-command.integration.test.mjs",
+    "test:harness": "node --test tests/mcp.integration.test.mjs tests/file-ops.integration.test.mjs tests/lsp.integration.test.mjs tests/code-search.integration.test.mjs tests/git-write.integration.test.mjs tests/agent-dag.integration.test.mjs tests/agent-command.integration.test.mjs tests/android-harness.unit.test.mjs tests/android-task-recovery.test.mjs tests/android-admin-approval.test.mjs tests/unattended-dev.integration.test.mjs tests/skills-provider.test.mjs tests/custom-tools.unit.test.mjs",
+    "test:agent-e2e": "node --test tests/agent-command.integration.test.mjs tests/agent-dag.integration.test.mjs",
+    "test:git-write": "node --test tests/git-write.integration.test.mjs",
+    "test:file-ops": "node --test tests/file-ops.integration.test.mjs",
+    "test:lsp": "node --test tests/lsp.integration.test.mjs",
+    "test:code-search": "node --test tests/code-search.integration.test.mjs",
+    "test:mumu": "node tests/mumu-calculator.acceptance.mjs",
     "install:opencode": "npm install --prefix packages/opencode-adapter --cache .tmp/cache/npm --no-audit --no-fund --ignore-scripts",
     "verify:opencode": "node packages/opencode-adapter/verify.mjs",
     "clean:tmp": "node scripts/clean-tmp.mjs"
@@ -20,6 +25,8 @@
   "dependencies": {
     "@modelcontextprotocol/server": "2.3.1",
     "diff": "8.0.4",
+    "typescript": "6.0.3",
+    "typescript-language-server": "6.0.2",
     "zod": "4.6.7"
   },
   "devDependencies": {

@@ -11,7 +11,7 @@ const STATE_LOCK_STALE_MS = 60_000
 export async function ensureLayout() {
   await ensurePlainDirectory(DATA_DIR)
   await ensurePlainDirectory(TMP_DIR)
-  for (const child of ["build", "cache", "sessions", "tests", "downloads", "diagnostics", "logs", "uploads"]) {
+  for (const child of ["build", "cache", "sessions", "tests", "downloads", "diagnostics", "logs", "uploads", "worktrees", "git-indexes"]) {
     await ensurePlainDirectory(path.join(TMP_DIR, child))
   }
 }
@@ -85,6 +85,12 @@ export function mutateArray(key, mutate) {
   }))
   queues.set(key, operation)
   return operation
+}
+
+export function withNamedStateLock(key, action) {
+  if (typeof key !== "string" || !/^[A-Za-z0-9_-]{1,96}$/.test(key)) throw new TypeError("持久化锁名称无效")
+  if (typeof action !== "function") throw new TypeError("持久化锁操作无效")
+  return withStateLock(key, action)
 }
 
 async function withStateLock(key, action) {

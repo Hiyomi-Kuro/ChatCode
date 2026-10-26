@@ -1,0 +1,19 @@
+{
+  "id": "project-summary",
+  "namespace": "project",
+  "version": "1.0.0",
+  "title": "Project summary",
+  "description": "Read-only project file and build-marker summary for an authorized workspace.",
+  "enabledByDefault": true,
+  "entry": "source-controlled",
+  "capabilities": ["workspace_read"],
+  "executables": [],
+  "pathScope": "authorized_workspace",
+  "deviceScope": null,
+  "permissionLevel": "read_only",
+  "timeoutMs": 30000,
+  "redLines": ["No writes", "No shell execution", "No workspace root changes"],
+  "tools": [
+    { "name": "summary", "mcpName": "project_summary", "inputSchema": { "type": "object", "required": ["workspace_id"], "properties": { "workspace_id": { "type": "string", "format": "uuid" }, "max_depth": { "type": "integer", "minimum": 1, "maximum": 8 }, "max_files": { "type": "integer", "minimum": 1, "maximum": 500 } }, "additionalProperties": false }, "permission": "read", "hints": { "readOnly": true, "recoverable": false, "highRisk": false } }
+  ]
+}
